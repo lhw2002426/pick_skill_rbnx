@@ -1,0 +1,58 @@
+# pick_skill_rbnx — pick-up-a-named-object skill.
+#
+# kind: skill (user-invocable atomic intent). Pilot's LLM calls
+# `robonix/skill/pick/pick(object_name)` and the skill orchestrates
+# three upstream services in sequence:
+#   * service/perception/object_detect/detect_object   (yolo_world)
+#   * service/perception/grasp_pose/grasp_request      (yolo_grasp)
+#   * service/manipulation/execute_grasp               (piper_moveit)
+#
+# All three are called over MCP HTTP via FastMCP's Client; atlas
+# resolves the URLs at on_activate time. There is intentionally no
+# fallback to the legacy ROS service path (/yolo/detect_object,
+# /graspnet/grasp_request, /graspnet/grasps) — Stage 6's whole point
+# is the LLM-facing surface speaks robonix contracts.
+#
+# Lifecycle (per Robonix developer guide §5 — skills are different):
+#   CMD_INIT      -> on_init: light. State machine reaches
+#                    INITIALIZED at boot even if upstream peers are
+#                    still warming up. cfg parsed for forward compat.
+#   CMD_ACTIVATE  -> on_activate: executor sends this on the FIRST
+#                    LLM call. Resolve the three upstream MCP
+#                    endpoints (block up to 60s waiting for them).
+#                    No FastMCP client construction here — done
+#                    lazily in the handler.
+#   CMD_DEACTIVATE -> on_deactivate: drop endpoints + client cache.
+#
+# Capability surface (all under robonix/skill/pick/*):
+#   driver  — auto-declared by the framework (lifecycle gRPC entry).
+#   pick    — MCP tool: synchronous, blocks until grasp completes
+#             or budget exhausts.
+#
+# Single-tool design (vs explore_rbnx's three-tool task_id model):
+#   pick.py upstream is synchronous (~10–30s end-to-end), and the
+#   LLM-driven use case is "block on pick until done; either it
+#   worked or it didn't". So no task_id / status / cancel siblings.
+#   If async is needed later, add them as a separate breaking
+#   contract bump rather than retrofitting.
+#
+# Config (passed via Driver(CMD_INIT, config_json)):
+#   default_timeout_s    default 60.0  — total budget when caller
+#                                         passes timeout_s=0
+#   default_max_retries  default 5     — grasp_pose retries when
+#                                         caller passes max_retries=0
+manifestVersion: 1
+
+package:
+  name: com.robonix.skill.pick
+  version: 0.1.0
+  vendor: robonix
+  description: Pick-up-a-named-object skill — orchestrates perception + manipulation services.
+  license: MulanPSL-2.0
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+
+capabilities:
+  - name: robonix/skill/pick/driver
+  - name: robonix/skill/pick/pick

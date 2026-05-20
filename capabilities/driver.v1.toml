@@ -1,0 +1,16 @@
+# Lifecycle interface for the pick skill.
+# `rbnx boot` calls Driver(CMD_INIT, config_json) on every package and
+# stops there for skills (state = INITIALIZED). The executor sends
+# Driver(CMD_ACTIVATE) on the FIRST MCP call, at which point on_activate
+# resolves the upstream perception + manipulation services via atlas
+# and builds the PickController. Without this contract the
+# on_init/on_activate handlers never fire and every MCP call returns
+# "controller not initialized".
+[contract]
+id      = "robonix/skill/pick/driver"
+version = "1"
+kind    = "skill"
+idl     = "lifecycle/srv/Driver.srv"
+
+[mode]
+type = "rpc"

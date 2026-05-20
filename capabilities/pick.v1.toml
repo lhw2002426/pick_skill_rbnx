@@ -1,0 +1,23 @@
+# robonix/skill/pick/pick — pick up a named object with the robot arm.
+#
+# User-invocable atomic intent: "go grasp the X for me". Internally
+# orchestrates three upstream services in sequence:
+#   1. service/perception/object_detect/detect_object  — find the object
+#   2. service/perception/grasp_pose/grasp_request     — compute a grasp
+#   3. service/manipulation/execute_grasp              — drive the arm
+#
+# Synchronous: the call blocks until either the arm finishes the
+# grasp motion (success) or the budget is exhausted (timeout). pick.py
+# upstream is synchronous too — we mirror that semantic so the typing
+# stays simple (no task_id / status / cancel sibling contracts).
+[contract]
+id      = "robonix/skill/pick/pick"
+version = "1"
+kind    = "skill"
+idl     = "pick/srv/Pick.srv"
+
+[mode]
+type = "rpc"
+
+[semantics]
+user_invocable = true

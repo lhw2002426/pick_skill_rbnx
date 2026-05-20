@@ -1,0 +1,44 @@
+# Pick a named object with the arm.
+
+# Request
+# Open-vocabulary object name. YOLO-World matches against its 4585
+# predefined classes; the upstream detector tolerates substring +
+# partial-word matching, so "the red cup" usually still resolves to
+# "cup" (whichever class wins).
+string object_name
+
+# Total budget for the whole pipeline (detect + grasp + execute).
+# 0 = use the default (60 s — enough for 5 grasp retries × ~8 s
+# planning+execution each, plus YOLOE inference).
+float32 timeout_s
+
+# Maximum number of grasp_pose retries before giving up.
+# 0 = use the default (5; same as upstream pick.py).
+int32 max_retries
+---
+# Response
+
+# Whether the arm completed the grasp motion (= execute_grasp returned
+# success=True for the chosen grasp pose).
+bool success
+
+# Free-form status. On failure, identifies which stage broke:
+#   "detection_failed: ..."
+#   "grasp_pose_failed_after_N_retries: ..."
+#   "execute_grasp_failed: ..."
+#   "timeout: ..."
+string message
+
+# The grasp pose that was chosen + executed (PoseStamped in the camera
+# optical frame). If success=false this is the LAST attempted pose
+# (debugging aid); fields are zero if no grasp pose was ever computed.
+geometry_msgs/PoseStamped grasp_pose
+
+# Gripper opening for the chosen grasp (m). 0 if no grasp computed.
+float32 gripper_width
+
+# Score (heuristic / handler-defined) of the chosen grasp. 0 if no grasp.
+float32 score
+
+# How long the whole call took (s).
+float32 elapsed_s
