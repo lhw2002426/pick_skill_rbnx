@@ -99,10 +99,25 @@ REQUIRED_INPUTS = {
     "execute_grasp":  ("robonix/service/manipulation/execute_grasp",             "mcp"),
 }
 
+# Optional upstreams — pick still activates if these are missing on
+# atlas, but each key has degraded behaviour documented:
+#   "reset" — calls /moveit_control/reset on the cpp executor at
+#             the start of every pick() so its sticky state flags
+#             (is_busy_, need_to_adjust_gripper_, …) are clean.
+#             If unavailable, pick will skip the reset call; the
+#             first pick still works, but a second pick is likely
+#             to wedge on cpp.is_busy_=true. Fixed in piper_moveit_rbnx
+#             >= the commit that added /moveit_control/reset.
+OPTIONAL_INPUTS = {
+    "reset":          ("robonix/service/manipulation/reset",                     "mcp"),
+}
+
 
 def _resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
-    """Block until atlas can resolve all three upstream MCP endpoints,
-    or fail loudly. Same shape as explore_rbnx.resolve_inputs."""
+    """Block until atlas can resolve all REQUIRED_INPUTS upstream MCP
+    endpoints, or fail loudly. Then best-effort resolve OPTIONAL_INPUTS
+    — missing optionals only generate a warning. Same shape as
+    explore_rbnx.resolve_inputs."""
     resolved: dict[str, str] = {}
     deadline = time.time() + deadline_s
     while time.time() < deadline:
@@ -124,16 +139,41 @@ def _resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
                 resolved[key] = ep
                 log.info("resolved %s [%s] → %s", cid, transport, ep)
         if len(resolved) == len(REQUIRED_INPUTS):
-            return resolved
+            break
         time.sleep(2.0)
+
     missing = [k for k in REQUIRED_INPUTS if k not in resolved]
-    raise RuntimeError(
-        f"pick skill cannot find dependencies on atlas: missing "
-        f"{[REQUIRED_INPUTS[k][0] for k in missing]}. The skill needs "
-        f"yolo_world_rbnx (object_detect) + yolo_grasp_rbnx (grasp_pose) "
-        f"+ piper_moveit_rbnx (manipulation/execute_grasp) all ACTIVE "
-        f"before it can run. There is intentionally no ROS-service "
-        f"fallback — packaging-spec invariant #1.")
+    if missing:
+        raise RuntimeError(
+            f"pick skill cannot find dependencies on atlas: missing "
+            f"{[REQUIRED_INPUTS[k][0] for k in missing]}. The skill needs "
+            f"yolo_world_rbnx (object_detect) + yolo_grasp_rbnx (grasp_pose) "
+            f"+ piper_moveit_rbnx (manipulation/execute_grasp) all ACTIVE "
+            f"before it can run. There is intentionally no ROS-service "
+            f"fallback — packaging-spec invariant #1.")
+
+    # Best-effort resolve OPTIONAL_INPUTS. Single shot — if they're not
+    # advertised yet, log a warning and move on. They'll be silently
+    # skipped at call time.
+    for key, (cid, transport) in OPTIONAL_INPUTS.items():
+        try:
+            cap_view = ATLAS.find_unique_capability(
+                contract_id=cid, transport=transport)
+            ch = pick_skill.connect_capability(cap_view, cid, transport)
+            ep = ch.endpoint
+            try:
+                ch.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if ep:
+                resolved[key] = ep
+                log.info("resolved %s [%s] → %s (optional)", cid, transport, ep)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "optional dep %s not on atlas — pick will run without it. "
+                "See OPTIONAL_INPUTS docstring for degraded behaviour.", cid)
+
+    return resolved
 
 
 # ── MCP client helpers ──────────────────────────────────────────────────────
@@ -176,6 +216,33 @@ def _mcp_call_sync(url: str, tool: str, args: dict) -> dict:
 
 
 # ── pipeline stages ─────────────────────────────────────────────────────────
+def _stage_reset() -> dict:
+    """Stage 0 (preflight): reset the manipulation state machine.
+
+    Calls piper_moveit_rbnx's `manipulation/reset` MCP, which in turn
+    calls /moveit_control/reset on the cpp executor. Clears sticky
+    is_busy_ flags and parks the arm at init pose so the upcoming
+    grasp starts from a known-clean state.
+
+    Optional — if reset capability isn't on atlas (e.g. older
+    piper_moveit_rbnx), this is a no-op and pick() proceeds without
+    it. Documented degradation: a second pick() in the same session
+    may wedge on the cpp's stale is_busy_=true.
+    """
+    assert _endpoints is not None
+    if "reset" not in _endpoints:
+        log.warning("stage0 reset SKIPPED — "
+                    "manipulation/reset not on atlas (older piper_moveit?)")
+        return {"success": True, "message": "skipped (capability missing)",
+                "elapsed_s": 0.0}
+    log.info("stage0 reset (clear cpp state machine, park arm)")
+    resp = _mcp_call_sync(_endpoints["reset"], "reset", {"ack": True})
+    log.info("stage0 result: success=%s msg=%r elapsed=%.2fs",
+             resp.get("success"), resp.get("message", "")[:60],
+             float(resp.get("elapsed_s", 0.0)))
+    return resp
+
+
 def _stage_detect_object(object_name: str) -> dict:
     """Stage 1: localize the object in the camera frame."""
     assert _endpoints is not None
@@ -321,6 +388,20 @@ def pick(req: Pick_Request) -> Pick_Response:
 
     t0 = time.monotonic()
     deadline = t0 + total_to
+
+    # ── Stage 0: reset (preflight, best-effort) ────────────────────────────
+    # Clear the cpp moveit_control state machine + park arm at init.
+    # We do NOT abort pick() if reset fails — first picks of a fresh
+    # boot don't need it (cpp state is already clean). It only
+    # matters for subsequent picks. Failure here just means the
+    # next stage will hit the existing wedge if there is one.
+    try:
+        rst = _stage_reset()
+        if not rst.get("success") and "_error" not in rst:
+            log.warning("reset returned success=false: %r — "
+                        "proceeding anyway", rst.get("message", "")[:80])
+    except Exception as e:  # noqa: BLE001
+        log.warning("reset stage raised: %s — proceeding anyway", e)
 
     # ── Stage 1: detect_object ─────────────────────────────────────────────
     det = _stage_detect_object(object_name)
