@@ -204,12 +204,77 @@ async def _mcp_call(url: str, tool: str, args: dict) -> dict:
             return {"raw": txt}
 
 
+# ── dedicated background asyncio loop for sync→async bridging ───────────────
+# We CAN'T use asyncio.run() from inside the @pick_skill.mcp handler
+# because robonix_api's MCP server (fastmcp.streamable_http) calls our
+# handler from a thread that already has a running asyncio event loop:
+#
+#     RuntimeError: asyncio.run() cannot be called from a running event loop
+#
+# Even when the handler is declared `def` (sync), fastmcp dispatches it
+# inside its own loop's executor, which means by the time _mcp_call_sync
+# fires there IS a running loop in this thread's context. asyncio.run()
+# refuses to nest.
+#
+# Standard fix: spin up a SEPARATE asyncio loop on a SEPARATE daemon
+# thread, and use run_coroutine_threadsafe() to schedule MCP calls onto
+# it. The handler thread (which is borrowed from fastmcp) blocks on
+# Future.result() — that's just a regular threading wait, not an
+# asyncio await, so it doesn't conflict with whatever loop the
+# handler thread happens to be running in.
+import threading as _threading_for_loop
+_bg_loop_lock = _threading_for_loop.Lock()
+_bg_loop: Optional[asyncio.AbstractEventLoop] = None
+_bg_loop_thread: Optional[_threading_for_loop.Thread] = None
+
+
+def _ensure_bg_loop() -> asyncio.AbstractEventLoop:
+    """Lazily start a daemon thread running its own asyncio loop forever.
+    Idempotent — every caller after the first gets the same loop."""
+    global _bg_loop, _bg_loop_thread
+    with _bg_loop_lock:
+        if _bg_loop is not None and _bg_loop.is_running():
+            return _bg_loop
+        loop = asyncio.new_event_loop()
+
+        def _runner() -> None:
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_forever()
+            finally:
+                # Clean exit: drain pending tasks then close.
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for t in pending:
+                        t.cancel()
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
+                except Exception:  # noqa: BLE001
+                    pass
+                loop.close()
+
+        t = _threading_for_loop.Thread(
+            target=_runner, name="pick-skill-mcp-loop", daemon=True)
+        t.start()
+        _bg_loop = loop
+        _bg_loop_thread = t
+        return loop
+
+
 def _mcp_call_sync(url: str, tool: str, args: dict) -> dict:
-    """Sync wrapper; spins a private event loop. We sync-call from the
-    @pick_skill.mcp handler thread — that thread isn't asyncio-aware
-    so asyncio.run() is fine."""
+    """Sync wrapper for _mcp_call. Schedules the coroutine on a
+    dedicated background event loop (see _ensure_bg_loop) and blocks
+    on the resulting concurrent.futures.Future. Safe to call from
+    inside another asyncio loop's thread (which is what fastmcp does
+    when invoking @pick_skill.mcp handlers)."""
+    loop = _ensure_bg_loop()
+    fut = asyncio.run_coroutine_threadsafe(
+        _mcp_call(url, tool, args), loop)
     try:
-        return asyncio.run(_mcp_call(url, tool, args))
+        # No timeout here — pipeline stages enforce their own budgets
+        # via the outer pick(timeout_s) total. If a single MCP RPC
+        # hangs forever we'd want a watchdog at a higher layer.
+        return fut.result()
     except Exception as e:  # noqa: BLE001
         log.warning("mcp call %s failed: %s", tool, e)
         return {"_error": str(e)}
