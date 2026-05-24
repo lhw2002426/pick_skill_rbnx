@@ -533,6 +533,14 @@ def pick(req: Pick_Request) -> Pick_Response:
     # If the cpp side genuinely fails, the failure is logged loudly
     # but pick() still returns success=True.
     #
+    # Mirroring the real-grasp success path, after demo lands we
+    # also sleep 2 s for visual confirmation and then call
+    # _safe_post_pick_reset() so the gripper closes back to 0.025
+    # and the arm parks at init (cpp's resetCallback) — without
+    # that step the demo would leave the arm stuck at the demo pose
+    # with the gripper open, and the NEXT pick would wedge on
+    # cpp's stale is_busy_ flag.
+    #
     # To enable for a demo:
     #   1. Make sure piper_moveit_rbnx is rebuilt with the demo
     #      service (commit adding /moveit_control/demo).
@@ -553,6 +561,12 @@ def pick(req: Pick_Request) -> Pick_Response:
     #     except Exception as e:  # noqa: BLE001
     #         log.warning("demo stage raised: %s — reporting success anyway",
     #                     e)
+    #     # Mirror the real-grasp success path: hold the demo pose
+    #     # 2 s for visual confirmation, then reset (close gripper
+    #     # to 0.025 + park arm at init).
+    #     log.info("DEMO MODE: holding demo pose 2.0s before post-pick reset")
+    #     time.sleep(2.0)
+    #     _safe_post_pick_reset("after demo success")
     #     return Pick_Response(
     #         success=True, message="ok (demo mode)",
     #         grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
