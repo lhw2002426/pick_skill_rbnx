@@ -19,10 +19,16 @@ ROS topic / service names):
                       │
                       ▼
                       ┌──── 3. execute_grasp ────►  piper_moveit_rbnx
-                      │       (grasp_pose + gripper_width + timeout)
+                      │       (grasp_pose + gripper_width=0.04 + timeout)
+                      │       (overrides yolo_grasp's suggested width to
+                      │        a fixed 4 cm partial-close)
                       │
                       ▼
-                      success → return
+                      success → sleep 2s (visual confirmation)
+                                → 4. reset (post-grasp park)
+                                       ──────►  piper_moveit_rbnx
+                                       (open gripper + moveArmtoInit)
+                                → return success
                       failure → next retry (different grasp candidate)
 
 Why MCP-everywhere instead of mixing in raw ROS service calls (the
@@ -101,13 +107,14 @@ REQUIRED_INPUTS = {
 
 # Optional upstreams — pick still activates if these are missing on
 # atlas, but each key has degraded behaviour documented:
-#   "reset" — calls /moveit_control/reset on the cpp executor at
-#             the start of every pick() so its sticky state flags
-#             (is_busy_, need_to_adjust_gripper_, …) are clean.
-#             If unavailable, pick will skip the reset call; the
-#             first pick still works, but a second pick is likely
-#             to wedge on cpp.is_busy_=true. Fixed in piper_moveit_rbnx
-#             >= the commit that added /moveit_control/reset.
+#   "reset" — POST-GRASP park. Called 2s after a successful
+#             execute_grasp so the arm parks back at init pose with
+#             the gripper open (cpp opens to 0.025 + moveArmtoInit).
+#             If unavailable, pick still returns success but the arm
+#             stays at the grasp pose with the gripper closed; the
+#             NEXT pick will then wedge because cpp's is_busy_=true
+#             flag is still set. Fixed in piper_moveit_rbnx >= the
+#             commit that added /moveit_control/reset.
 OPTIONAL_INPUTS = {
     "reset":          ("robonix/service/manipulation/reset",                     "mcp"),
 }
@@ -282,27 +289,31 @@ def _mcp_call_sync(url: str, tool: str, args: dict) -> dict:
 
 # ── pipeline stages ─────────────────────────────────────────────────────────
 def _stage_reset() -> dict:
-    """Stage 0 (preflight): reset the manipulation state machine.
+    """Post-grasp park: reset the manipulation state machine + park
+    the arm at init.
 
     Calls piper_moveit_rbnx's `manipulation/reset` MCP, which in turn
     calls /moveit_control/reset on the cpp executor. Clears sticky
-    is_busy_ flags and parks the arm at init pose so the upcoming
-    grasp starts from a known-clean state.
+    is_busy_ flags, opens the gripper to a neutral wide width, and
+    parks the arm at init pose. Called AFTER a successful grasp (with
+    a 2s hold beforehand for visual confirmation) so the next pick
+    starts from a known-clean state.
 
     Optional — if reset capability isn't on atlas (e.g. older
-    piper_moveit_rbnx), this is a no-op and pick() proceeds without
-    it. Documented degradation: a second pick() in the same session
-    may wedge on the cpp's stale is_busy_=true.
+    piper_moveit_rbnx), this is a no-op and pick() still returns
+    success, but the arm will stay at the grasp pose with the gripper
+    closed. The NEXT pick will then wedge on cpp's stale
+    is_busy_=true flag.
     """
     assert _endpoints is not None
     if "reset" not in _endpoints:
-        log.warning("stage0 reset SKIPPED — "
+        log.warning("post-grasp reset SKIPPED — "
                     "manipulation/reset not on atlas (older piper_moveit?)")
         return {"success": True, "message": "skipped (capability missing)",
                 "elapsed_s": 0.0}
-    log.info("stage0 reset (clear cpp state machine, park arm)")
+    log.info("post-grasp reset (open gripper, park arm at init)")
     resp = _mcp_call_sync(_endpoints["reset"], "reset", {"ack": True})
-    log.info("stage0 result: success=%s msg=%r elapsed=%.2fs",
+    log.info("post-grasp reset result: success=%s msg=%r elapsed=%.2fs",
              resp.get("success"), resp.get("message", "")[:60],
              float(resp.get("elapsed_s", 0.0)))
     return resp
@@ -454,19 +465,16 @@ def pick(req: Pick_Request) -> Pick_Response:
     t0 = time.monotonic()
     deadline = t0 + total_to
 
-    # ── Stage 0: reset (preflight, best-effort) ────────────────────────────
-    # Clear the cpp moveit_control state machine + park arm at init.
-    # We do NOT abort pick() if reset fails — first picks of a fresh
-    # boot don't need it (cpp state is already clean). It only
-    # matters for subsequent picks. Failure here just means the
-    # next stage will hit the existing wedge if there is one.
-    try:
-        rst = _stage_reset()
-        if not rst.get("success") and "_error" not in rst:
-            log.warning("reset returned success=false: %r — "
-                        "proceeding anyway", rst.get("message", "")[:80])
-    except Exception as e:  # noqa: BLE001
-        log.warning("reset stage raised: %s — proceeding anyway", e)
+    # NOTE: pre-grasp reset has been REMOVED (was Stage 0 here).
+    # New policy: reset runs AFTER a successful grasp (post-grasp
+    # park), not before. The first pick of a fresh boot always
+    # starts from a clean cpp state anyway (cpp's __init__ calls
+    # controlGripper(0.12) + moveArmtoInit() at startup); a
+    # subsequent pick is preceded by the post-grasp reset of the
+    # PREVIOUS pick, so the cpp state is still clean entering this
+    # pick. Net: same correctness as preflight reset, but the user
+    # sees the arm hold the grasp pose for 2s before parking, which
+    # is the requested visual behaviour.
 
     # ── Stage 1: detect_object ─────────────────────────────────────────────
     det = _stage_detect_object(object_name)
@@ -523,11 +531,37 @@ def pick(req: Pick_Request) -> Pick_Response:
         else:
             exec_to = remaining
 
-        eg = _stage_execute_grasp(last_grasp_pose_dict, last_gripper_width,
+        # Override the yolo_grasp-suggested gripper_width with a fixed
+        # 4 cm partial-close. Rationale: for the current test setup we
+        # want a deterministic, visually obvious "grasp confirmation"
+        # (jaws partially closed, holding the pose) rather than a
+        # full-close that depends on object geometry. yolo_grasp's
+        # estimate is preserved in last_gripper_width for the
+        # response, but the cpp executor receives 0.04.
+        EXEC_GRIPPER_WIDTH = 0.04
+        eg = _stage_execute_grasp(last_grasp_pose_dict, EXEC_GRIPPER_WIDTH,
                                    exec_to)
 
         if "_error" not in eg and eg.get("success"):
-            # Success — done.
+            # Grasp succeeded — arm is at the target pose with the
+            # gripper closed to 4 cm. Hold this pose for 2 s so the
+            # user can visually confirm the grasp, then post-grasp
+            # reset (cpp opens gripper to 0.025 + moveArmtoInit).
+            log.info("grasp successful — holding pose 2.0s before post-grasp reset")
+            time.sleep(2.0)
+            try:
+                rst = _stage_reset()
+                if not rst.get("success") and "_error" not in rst:
+                    log.warning("post-grasp reset returned success=false: %r "
+                                "— grasp itself was OK, but arm may not be "
+                                "parked at init",
+                                rst.get("message", "")[:80])
+            except Exception as e:  # noqa: BLE001
+                log.warning("post-grasp reset stage raised: %s — "
+                            "grasp itself was OK", e)
+
+            # Success — done. We report the yolo_grasp gripper_width
+            # in the response (what was *planned*), not the override.
             return Pick_Response(
                 success=True, message="ok",
                 grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
