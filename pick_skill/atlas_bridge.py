@@ -25,11 +25,16 @@ ROS topic / service names):
                       │
                       ▼
                       success → sleep 2s (visual confirmation)
-                                → 4. reset (post-grasp park)
+                                → 4. reset (post-pick park)
                                        ──────►  piper_moveit_rbnx
                                        (open gripper + moveArmtoInit)
                                 → return success
                       failure → next retry (different grasp candidate)
+
+                  After loop exit (timeout / retries exhausted /
+                  detection failure): also call reset before returning,
+                  so cpp's sticky state machine flags (is_busy_, …)
+                  don't silently break the NEXT pick.
 
 Why MCP-everywhere instead of mixing in raw ROS service calls (the
 upstream pick.py path):
@@ -295,15 +300,19 @@ def _stage_reset() -> dict:
     Calls piper_moveit_rbnx's `manipulation/reset` MCP, which in turn
     calls /moveit_control/reset on the cpp executor. Clears sticky
     is_busy_ flags, opens the gripper to a neutral wide width, and
-    parks the arm at init pose. Called AFTER a successful grasp (with
-    a 2s hold beforehand for visual confirmation) so the next pick
-    starts from a known-clean state.
+    parks the arm at init pose so the next pick starts from a
+    known-clean state.
+
+    Called BOTH after a successful grasp (with a 2s pre-hold for
+    visual confirmation, see pick()) AND after every failed pick
+    attempt (to clean up cpp state — most failures leave is_busy_=
+    true or a stale need_to_return_init_pose_ flag, which would
+    silently break the NEXT pick).
 
     Optional — if reset capability isn't on atlas (e.g. older
     piper_moveit_rbnx), this is a no-op and pick() still returns
-    success, but the arm will stay at the grasp pose with the gripper
-    closed. The NEXT pick will then wedge on cpp's stale
-    is_busy_=true flag.
+    its grasp result, but the arm will not be parked. The NEXT pick
+    will then likely wedge on cpp's stale is_busy_=true flag.
     """
     assert _endpoints is not None
     if "reset" not in _endpoints:
@@ -317,6 +326,24 @@ def _stage_reset() -> dict:
              resp.get("success"), resp.get("message", "")[:60],
              float(resp.get("elapsed_s", 0.0)))
     return resp
+
+
+def _safe_post_pick_reset(context: str) -> None:
+    """Best-effort post-pick reset, never raises.
+
+    Used by every pick() exit path (success AND failure) to leave
+    cpp in a clean state for the next pick. Logs but swallows any
+    exception/error so it can't poison the response we're about to
+    return to the caller.
+    """
+    try:
+        rst = _stage_reset()
+        if not rst.get("success") and "_error" not in rst:
+            log.warning("post-pick reset (%s) returned success=false: %r "
+                        "— arm may not be parked at init",
+                        context, rst.get("message", "")[:80])
+    except Exception as e:  # noqa: BLE001
+        log.warning("post-pick reset (%s) raised: %s — continuing", context, e)
 
 
 def _stage_detect_object(object_name: str) -> dict:
@@ -480,6 +507,11 @@ def pick(req: Pick_Request) -> Pick_Response:
     det = _stage_detect_object(object_name)
     if "_error" in det or not det.get("success"):
         msg = det.get("_error") or det.get("message", "unknown")
+        # Detection failed — but cpp state may already be dirty from a
+        # PREVIOUS pick (this pick wouldn't have flipped it because we
+        # never even sent a GraspPose). Reset anyway so the next pick
+        # starts clean.
+        _safe_post_pick_reset("after detection_failed")
         return Pick_Response(
             success=False, message=f"detection_failed: {msg}",
             grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
@@ -498,6 +530,7 @@ def pick(req: Pick_Request) -> Pick_Response:
 
     for retry in range(max_retries):
         if time.monotonic() >= deadline:
+            _safe_post_pick_reset("after timeout")
             return Pick_Response(
                 success=False,
                 message=f"timeout: budget {total_to:.1f}s exhausted before retry {retry}",
@@ -549,16 +582,7 @@ def pick(req: Pick_Request) -> Pick_Response:
             # reset (cpp opens gripper to 0.025 + moveArmtoInit).
             log.info("grasp successful — holding pose 2.0s before post-grasp reset")
             time.sleep(2.0)
-            try:
-                rst = _stage_reset()
-                if not rst.get("success") and "_error" not in rst:
-                    log.warning("post-grasp reset returned success=false: %r "
-                                "— grasp itself was OK, but arm may not be "
-                                "parked at init",
-                                rst.get("message", "")[:80])
-            except Exception as e:  # noqa: BLE001
-                log.warning("post-grasp reset stage raised: %s — "
-                            "grasp itself was OK", e)
+            _safe_post_pick_reset("after success")
 
             # Success — done. We report the yolo_grasp gripper_width
             # in the response (what was *planned*), not the override.
@@ -574,7 +598,12 @@ def pick(req: Pick_Request) -> Pick_Response:
             f"{eg.get('_error') or eg.get('message', 'unknown')}")
         log.warning("%s — trying next grasp candidate", last_failure_msg)
 
-    # Exhausted retries.
+    # Exhausted retries. Reset before returning so cpp is clean for
+    # the next pick (most failure modes — `arm_status never went busy`,
+    # MoveIt plan failure mid-execution, etc. — leave cpp's is_busy_
+    # or other sticky flags in a state that would silently break the
+    # NEXT pick if we don't clear them here).
+    _safe_post_pick_reset("after retries exhausted")
     return Pick_Response(
         success=False,
         message=f"all {max_retries} retries failed; last: {last_failure_msg}",
