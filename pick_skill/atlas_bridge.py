@@ -90,7 +90,7 @@ _state_lock = threading.Lock()
 # Resolved upstream MCP endpoints. None until on_activate completes.
 # Three keys, three contract ids — see REQUIRED_INPUTS below.
 _endpoints: Optional[dict[str, str]] = None
-_default_timeout_s   = 60.0
+_default_timeout_s   = 30.0
 _default_max_retries = 5
 
 # We deliberately keep ONE FastMCP Client per upstream URL (lazily
@@ -493,124 +493,133 @@ def pick(req: Pick_Request) -> Pick_Response:
     deadline = t0 + total_to
 
     # NOTE: pre-grasp reset has been REMOVED (was Stage 0 here).
-    # New policy: reset runs AFTER a successful grasp (post-grasp
-    # park), not before. The first pick of a fresh boot always
-    # starts from a clean cpp state anyway (cpp's __init__ calls
-    # controlGripper(0.12) + moveArmtoInit() at startup); a
-    # subsequent pick is preceded by the post-grasp reset of the
-    # PREVIOUS pick, so the cpp state is still clean entering this
-    # pick. Net: same correctness as preflight reset, but the user
-    # sees the arm hold the grasp pose for 2s before parking, which
-    # is the requested visual behaviour.
+    # New policy: reset runs AFTER pick(), regardless of outcome
+    # (success / detection_failed / timeout / retries exhausted /
+    # uncaught exception). We achieve this with a single try/finally
+    # that wraps the entire pipeline, so we cannot accidentally miss
+    # a reset on some new failure path. The first pick of a fresh
+    # boot still doesn't strictly need pre-grasp reset because cpp's
+    # __init__ already does controlGripper(0.12) + moveArmtoInit();
+    # subsequent picks are preceded by the post-pick reset of the
+    # PREVIOUS call. The 2s "hold the grasp pose for visual
+    # confirmation" only fires on success — failure paths reset
+    # immediately, no pose-hold.
 
-    # ── Stage 1: detect_object ─────────────────────────────────────────────
-    det = _stage_detect_object(object_name)
-    if "_error" in det or not det.get("success"):
-        msg = det.get("_error") or det.get("message", "unknown")
-        # Detection failed — but cpp state may already be dirty from a
-        # PREVIOUS pick (this pick wouldn't have flipped it because we
-        # never even sent a GraspPose). Reset anyway so the next pick
-        # starts clean.
-        _safe_post_pick_reset("after detection_failed")
-        return Pick_Response(
-            success=False, message=f"detection_failed: {msg}",
-            grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-            gripper_width=0.0, score=0.0,
+    response: Pick_Response = Pick_Response(
+        success=False, message="pick aborted before any stage ran",
+        grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
+        gripper_width=0.0, score=0.0, elapsed_s=0.0,
+    )
+    grasp_succeeded = False
+
+    try:
+        # ── Stage 1: detect_object ─────────────────────────────────────────
+        det = _stage_detect_object(object_name)
+        if "_error" in det or not det.get("success"):
+            msg = det.get("_error") or det.get("message", "unknown")
+            response = Pick_Response(
+                success=False, message=f"detection_failed: {msg}",
+                grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
+                gripper_width=0.0, score=0.0,
+                elapsed_s=time.monotonic() - t0,
+            )
+            return response
+
+        bbox_2d   = list(det.get("bbox_2d") or [])
+        center_3d = list(det.get("object_center_3d") or [])
+
+        # ── Stage 2 + 3: grasp_request → execute_grasp, retry on failure ──
+        last_grasp_pose_dict: dict = _empty_pose_dict()
+        last_gripper_width   = 0.0
+        last_score           = 0.0
+        last_failure_msg     = "no attempts made"
+
+        for retry in range(max_retries):
+            if time.monotonic() >= deadline:
+                response = Pick_Response(
+                    success=False,
+                    message=(f"timeout: budget {total_to:.1f}s exhausted "
+                             f"before retry {retry}"),
+                    grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+                    gripper_width=last_gripper_width, score=last_score,
+                    elapsed_s=time.monotonic() - t0,
+                )
+                return response
+
+            # Stage 2: grasp_request.
+            gr = _stage_grasp_request(object_name, bbox_2d, center_3d, retry)
+            if "_error" in gr or not gr.get("success"):
+                last_failure_msg = (
+                    f"grasp_pose retry {retry}: "
+                    f"{gr.get('_error') or gr.get('message', 'unknown')}")
+                log.warning("%s — trying next", last_failure_msg)
+                continue
+
+            last_grasp_pose_dict = gr.get("grasp_pose") or _empty_pose_dict()
+            last_gripper_width   = float(gr.get("gripper_width", 0.0))
+            last_score           = float(gr.get("score", 0.0))
+
+            # Stage 3: execute_grasp. Use the remaining time budget so the
+            # whole pick respects req.timeout_s.
+            remaining = max(1.0, deadline - time.monotonic())
+            # Don't give execute_grasp the entire remaining budget if we
+            # still have retries left — leave some headroom for one more
+            # grasp_pose attempt if this one fails.
+            retries_left = max_retries - retry - 1
+            if retries_left > 0:
+                exec_to = min(remaining, max(8.0, remaining / (retries_left + 1)))
+            else:
+                exec_to = remaining
+
+            # Override the yolo_grasp-suggested gripper_width with a fixed
+            # 4 cm partial-close. Rationale: for the current test setup we
+            # want a deterministic, visually obvious "grasp confirmation"
+            # (jaws partially closed, holding the pose) rather than a
+            # full-close that depends on object geometry. yolo_grasp's
+            # estimate is preserved in last_gripper_width for the
+            # response, but the cpp executor receives 0.04.
+            EXEC_GRIPPER_WIDTH = 0.04
+            eg = _stage_execute_grasp(last_grasp_pose_dict, EXEC_GRIPPER_WIDTH,
+                                       exec_to)
+
+            if "_error" not in eg and eg.get("success"):
+                grasp_succeeded = True
+                # We report the yolo_grasp gripper_width in the response
+                # (what was *planned*), not the override.
+                response = Pick_Response(
+                    success=True, message="ok",
+                    grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+                    gripper_width=last_gripper_width, score=last_score,
+                    elapsed_s=time.monotonic() - t0,
+                )
+                return response
+
+            last_failure_msg = (
+                f"execute retry {retry}: "
+                f"{eg.get('_error') or eg.get('message', 'unknown')}")
+            log.warning("%s — trying next grasp candidate", last_failure_msg)
+
+        # Exhausted retries.
+        response = Pick_Response(
+            success=False,
+            message=f"all {max_retries} retries failed; last: {last_failure_msg}",
+            grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+            gripper_width=last_gripper_width, score=last_score,
             elapsed_s=time.monotonic() - t0,
         )
-
-    bbox_2d   = list(det.get("bbox_2d") or [])
-    center_3d = list(det.get("object_center_3d") or [])
-
-    # ── Stage 2 + 3: grasp_request → execute_grasp, retry on failure ─────
-    last_grasp_pose_dict: dict = _empty_pose_dict()
-    last_gripper_width   = 0.0
-    last_score           = 0.0
-    last_failure_msg     = "no attempts made"
-
-    for retry in range(max_retries):
-        if time.monotonic() >= deadline:
-            _safe_post_pick_reset("after timeout")
-            return Pick_Response(
-                success=False,
-                message=f"timeout: budget {total_to:.1f}s exhausted before retry {retry}",
-                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                gripper_width=last_gripper_width, score=last_score,
-                elapsed_s=time.monotonic() - t0,
-            )
-
-        # Stage 2: grasp_request.
-        gr = _stage_grasp_request(object_name, bbox_2d, center_3d, retry)
-        if "_error" in gr or not gr.get("success"):
-            last_failure_msg = (
-                f"grasp_pose retry {retry}: "
-                f"{gr.get('_error') or gr.get('message', 'unknown')}")
-            log.warning("%s — trying next", last_failure_msg)
-            continue
-
-        last_grasp_pose_dict = gr.get("grasp_pose") or _empty_pose_dict()
-        last_gripper_width   = float(gr.get("gripper_width", 0.0))
-        last_score           = float(gr.get("score", 0.0))
-
-        # Stage 3: execute_grasp. Use the remaining time budget so the
-        # whole pick respects req.timeout_s.
-        remaining = max(1.0, deadline - time.monotonic())
-        # Don't give execute_grasp the entire remaining budget if we
-        # still have retries left — leave some headroom for one more
-        # grasp_pose attempt if this one fails.
-        retries_left = max_retries - retry - 1
-        if retries_left > 0:
-            exec_to = min(remaining, max(8.0, remaining / (retries_left + 1)))
-        else:
-            exec_to = remaining
-
-        # Override the yolo_grasp-suggested gripper_width with a fixed
-        # 4 cm partial-close. Rationale: for the current test setup we
-        # want a deterministic, visually obvious "grasp confirmation"
-        # (jaws partially closed, holding the pose) rather than a
-        # full-close that depends on object geometry. yolo_grasp's
-        # estimate is preserved in last_gripper_width for the
-        # response, but the cpp executor receives 0.04.
-        EXEC_GRIPPER_WIDTH = 0.04
-        eg = _stage_execute_grasp(last_grasp_pose_dict, EXEC_GRIPPER_WIDTH,
-                                   exec_to)
-
-        if "_error" not in eg and eg.get("success"):
-            # Grasp succeeded — arm is at the target pose with the
-            # gripper closed to 4 cm. Hold this pose for 2 s so the
-            # user can visually confirm the grasp, then post-grasp
-            # reset (cpp opens gripper to 0.025 + moveArmtoInit).
-            log.info("grasp successful — holding pose 2.0s before post-grasp reset")
+        return response
+    finally:
+        # Single chokepoint: every pick() exit path lands here.
+        # On success: 2s pose-hold for visual confirmation, then reset.
+        # On failure: reset immediately, no hold.
+        # Either way, cpp ends up with clean state machine + arm at
+        # init pose + gripper open, ready for the next pick.
+        if grasp_succeeded:
+            log.info("grasp successful — holding pose 2.0s before post-pick reset")
             time.sleep(2.0)
             _safe_post_pick_reset("after success")
-
-            # Success — done. We report the yolo_grasp gripper_width
-            # in the response (what was *planned*), not the override.
-            return Pick_Response(
-                success=True, message="ok",
-                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                gripper_width=last_gripper_width, score=last_score,
-                elapsed_s=time.monotonic() - t0,
-            )
-
-        last_failure_msg = (
-            f"execute retry {retry}: "
-            f"{eg.get('_error') or eg.get('message', 'unknown')}")
-        log.warning("%s — trying next grasp candidate", last_failure_msg)
-
-    # Exhausted retries. Reset before returning so cpp is clean for
-    # the next pick (most failure modes — `arm_status never went busy`,
-    # MoveIt plan failure mid-execution, etc. — leave cpp's is_busy_
-    # or other sticky flags in a state that would silently break the
-    # NEXT pick if we don't clear them here).
-    _safe_post_pick_reset("after retries exhausted")
-    return Pick_Response(
-        success=False,
-        message=f"all {max_retries} retries failed; last: {last_failure_msg}",
-        grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-        gripper_width=last_gripper_width, score=last_score,
-        elapsed_s=time.monotonic() - t0,
-    )
+        else:
+            _safe_post_pick_reset("after failure")
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
