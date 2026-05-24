@@ -120,8 +120,16 @@ REQUIRED_INPUTS = {
 #             NEXT pick will then wedge because cpp's is_busy_=true
 #             flag is still set. Fixed in piper_moveit_rbnx >= the
 #             commit that added /moveit_control/reset.
+#   "demo"  — DEMO mode override. Calls cpp's /moveit_control/demo
+#             which opens gripper to 0.08 m and joint-space-moves
+#             to the DEMO pose. Used by the commented-out demo
+#             block at the top of pick() for showcase runs. If
+#             unavailable, the demo override block (when uncommented)
+#             will short-circuit the pick with a "demo unavailable"
+#             failure response.
 OPTIONAL_INPUTS = {
     "reset":          ("robonix/service/manipulation/reset",                     "mcp"),
+    "demo":           ("robonix/service/manipulation/demo",                      "mcp"),
 }
 
 
@@ -328,6 +336,30 @@ def _stage_reset() -> dict:
     return resp
 
 
+def _stage_demo() -> dict:
+    """Demo override: drive the arm to a fixed joint-space DEMO pose
+    with the gripper open ~8 cm.
+
+    Calls piper_moveit_rbnx's `manipulation/demo` MCP, which in turn
+    calls /moveit_control/demo on the cpp executor. Used by the
+    commented-out demo override block at the top of pick() —
+    showcase runs replace the real grasp pipeline (yolo_world →
+    yolo_grasp → execute_grasp) with this single deterministic call.
+    """
+    assert _endpoints is not None
+    if "demo" not in _endpoints:
+        log.warning("demo SKIPPED — manipulation/demo not on atlas "
+                    "(older piper_moveit, or demo not yet rebuilt?)")
+        return {"success": False, "message": "demo capability not on atlas",
+                "elapsed_s": 0.0}
+    log.info("demo (open gripper to demo width, move to demo pose)")
+    resp = _mcp_call_sync(_endpoints["demo"], "demo", {"ack": True})
+    log.info("demo result: success=%s msg=%r elapsed=%.2fs",
+             resp.get("success"), resp.get("message", "")[:60],
+             float(resp.get("elapsed_s", 0.0)))
+    return resp
+
+
 def _safe_post_pick_reset(context: str) -> None:
     """Best-effort post-pick reset, never raises.
 
@@ -485,6 +517,49 @@ def pick(req: Pick_Request) -> Pick_Response:
             grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
             gripper_width=0.0, score=0.0, elapsed_s=0.0,
         )
+
+    # ── DEMO MODE OVERRIDE ────────────────────────────────────────────
+    # Uncomment the block below to replace the real grasp pipeline
+    # with a single call to manipulation/demo. Every pick.pick(...)
+    # then resolves to "open gripper to ~8 cm + move to a fixed
+    # joint-space demo pose" — perfect for showcase / canned demos
+    # where the agent should look like it's grasping but you don't
+    # want to depend on perception + grasp planning succeeding.
+    #
+    # The demo path returns success=True unconditionally (i.e. it
+    # surfaces success=True to pilot whether or not the underlying
+    # cpp /moveit_control/demo Trigger reported success), so the
+    # LLM never says "I tried to grasp but failed" during a demo.
+    # If the cpp side genuinely fails, the failure is logged loudly
+    # but pick() still returns success=True.
+    #
+    # To enable for a demo:
+    #   1. Make sure piper_moveit_rbnx is rebuilt with the demo
+    #      service (commit adding /moveit_control/demo).
+    #   2. Uncomment the entire `if True:` block below + its return.
+    #   3. Restart pick_skill_rbnx (or just send CMD_DEACTIVATE +
+    #      CMD_ACTIVATE so OPTIONAL_INPUTS gets re-resolved with
+    #      the new demo endpoint).
+    # To disable: re-comment.
+    #
+    # ── BEGIN demo override ──
+    # if True:
+    #     log.info("DEMO MODE: bypassing real grasp pipeline; "
+    #              "calling manipulation/demo for object_name=%r",
+    #              object_name)
+    #     dt0 = time.monotonic()
+    #     try:
+    #         _stage_demo()
+    #     except Exception as e:  # noqa: BLE001
+    #         log.warning("demo stage raised: %s — reporting success anyway",
+    #                     e)
+    #     return Pick_Response(
+    #         success=True, message="ok (demo mode)",
+    #         grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
+    #         gripper_width=0.08, score=1.0,
+    #         elapsed_s=time.monotonic() - dt0,
+    #     )
+    # ── END demo override ──
 
     total_to    = float(req.timeout_s) if req.timeout_s > 0 else _default_timeout_s
     max_retries = int(req.max_retries) if req.max_retries > 0 else _default_max_retries
