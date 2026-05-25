@@ -121,15 +121,18 @@ REQUIRED_INPUTS = {
 #             flag is still set. Fixed in piper_moveit_rbnx >= the
 #             commit that added /moveit_control/reset.
 #   "demo"  — DEMO mode override. Calls cpp's /moveit_control/demo
-#             which opens gripper to 0.08 m and joint-space-moves
-#             to the DEMO pose. Used by the commented-out demo
-#             block at the top of pick() for showcase runs. If
-#             unavailable, the demo override block (when uncommented)
-#             will short-circuit the pick with a "demo unavailable"
-#             failure response.
+#             which opens gripper to 0.08 m, joint-space-moves to
+#             the DEMO pose, then closes gripper to 0.025 m
+#             (simulating a grasp). Used by the commented-out demo
+#             override block at the top of pick() for showcase runs.
+#   "demo_place" — sibling of demo for the "place" half of a
+#             pick-and-place demo. Calls cpp's
+#             /moveit_control/demo_place which drives to DEMO PLACE
+#             pose, holds 2 s, opens gripper, parks at init.
 OPTIONAL_INPUTS = {
     "reset":          ("robonix/service/manipulation/reset",                     "mcp"),
     "demo":           ("robonix/service/manipulation/demo",                      "mcp"),
+    "demo_place":     ("robonix/service/manipulation/demo_place",                "mcp"),
 }
 
 
@@ -360,6 +363,29 @@ def _stage_demo() -> dict:
     return resp
 
 
+def _stage_demo_place() -> dict:
+    """Demo place override: drive the arm to a fixed joint-space
+    DEMO PLACE pose, hold 2 s, open gripper, park at init.
+
+    Calls piper_moveit_rbnx's `manipulation/demo_place` MCP, which in
+    turn calls /moveit_control/demo_place on the cpp executor. Used
+    by the commented-out demo-place override block in pick() for
+    canned pick-and-place showcase runs (paired with _stage_demo).
+    """
+    assert _endpoints is not None
+    if "demo_place" not in _endpoints:
+        log.warning("demo_place SKIPPED — manipulation/demo_place not on atlas "
+                    "(older piper_moveit, or demo_place not yet rebuilt?)")
+        return {"success": False, "message": "demo_place capability not on atlas",
+                "elapsed_s": 0.0}
+    log.info("demo_place (move to demo place pose, hold, open gripper, park at init)")
+    resp = _mcp_call_sync(_endpoints["demo_place"], "demo_place", {"ack": True})
+    log.info("demo_place result: success=%s msg=%r elapsed=%.2fs",
+             resp.get("success"), resp.get("message", "")[:60],
+             float(resp.get("elapsed_s", 0.0)))
+    return resp
+
+
 def _safe_post_pick_reset(context: str) -> None:
     """Best-effort post-pick reset, never raises.
 
@@ -574,6 +600,45 @@ def pick(req: Pick_Request) -> Pick_Response:
     #         elapsed_s=time.monotonic() - dt0,
     #     )
     # ── END demo override ──
+
+    # ── DEMO PLACE OVERRIDE ───────────────────────────────────────────
+    # Sibling of the demo override block above — uncomment THIS one
+    # instead (don't uncomment both; the first one to short-circuit
+    # wins and the second is unreachable) when you want every
+    # pick.pick(...) to play the "place" half of a pick-and-place
+    # demo: drive to a fixed DEMO PLACE pose, hold 2 s, open gripper,
+    # park at init.
+    #
+    # Same success semantics as the demo override: returns success=True
+    # unconditionally, mirroring the real-grasp success path with a
+    # 2 s pose-hold + post-pick reset (close gripper + park at init).
+    # cpp side already opens the gripper as part of demo_place itself,
+    # so the post-pick reset's controlGripper(0.025) immediately re-
+    # closes it — that's intentional, mirrors the close-on-park
+    # invariant of the real grasp pipeline.
+    #
+    # ── BEGIN demo_place override ──
+    # if True:
+    #     log.info("DEMO PLACE MODE: bypassing real grasp pipeline; "
+    #              "calling manipulation/demo_place for object_name=%r",
+    #              object_name)
+    #     dt0 = time.monotonic()
+    #     try:
+    #         _stage_demo_place()
+    #     except Exception as e:  # noqa: BLE001
+    #         log.warning("demo_place stage raised: %s — "
+    #                     "reporting success anyway", e)
+    #     log.info("DEMO PLACE MODE: holding place pose 2.0s before "
+    #              "post-pick reset")
+    #     time.sleep(2.0)
+    #     _safe_post_pick_reset("after demo_place success")
+    #     return Pick_Response(
+    #         success=True, message="ok (demo place mode)",
+    #         grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
+    #         gripper_width=0.08, score=1.0,
+    #         elapsed_s=time.monotonic() - dt0,
+    #     )
+    # ── END demo_place override ──
 
     total_to    = float(req.timeout_s) if req.timeout_s > 0 else _default_timeout_s
     max_retries = int(req.max_retries) if req.max_retries > 0 else _default_max_retries
