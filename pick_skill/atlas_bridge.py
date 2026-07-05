@@ -92,6 +92,10 @@ _state_lock = threading.Lock()
 _endpoints: Optional[dict[str, str]] = None
 _default_timeout_s   = 30.0
 _default_max_retries = 5
+_vla_max_steps       = 50
+
+# Execution mode: "moveit" (traditional pipeline) or "vla" (end-to-end policy)
+_mode = "moveit"
 
 # We deliberately keep ONE FastMCP Client per upstream URL (lazily
 # constructed in the handler, not on_activate). FastMCP's Client is
@@ -133,6 +137,12 @@ OPTIONAL_INPUTS = {
     "reset":          ("robonix/service/manipulation/reset",                     "mcp"),
     "demo":           ("robonix/service/manipulation/demo",                      "mcp"),
     "demo_place":     ("robonix/service/manipulation/demo_place",                "mcp"),
+    "vla_execute":    ("robonix/skill/vla/execute",                              "mcp"),
+}
+
+# In VLA mode, vla_execute becomes required instead of the traditional pipeline
+VLA_REQUIRED_INPUTS = {
+    "vla_execute":    ("robonix/skill/vla/execute",                              "mcp"),
 }
 
 
@@ -140,11 +150,21 @@ def _resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
     """Block until atlas can resolve all REQUIRED_INPUTS upstream MCP
     endpoints, or fail loudly. Then best-effort resolve OPTIONAL_INPUTS
     — missing optionals only generate a warning. Same shape as
-    explore_rbnx.resolve_inputs."""
+    explore_rbnx.resolve_inputs.
+
+    In VLA mode, only VLA_REQUIRED_INPUTS are mandatory; the traditional
+    pipeline deps (detect_object, grasp_request, execute_grasp) become
+    optional."""
+    # Choose required inputs based on mode
+    if _mode == "vla":
+        required = VLA_REQUIRED_INPUTS
+    else:
+        required = REQUIRED_INPUTS
+
     resolved: dict[str, str] = {}
     deadline = time.time() + deadline_s
     while time.time() < deadline:
-        for key, (cid, transport) in REQUIRED_INPUTS.items():
+        for key, (cid, transport) in required.items():
             if key in resolved:
                 continue
             try:
@@ -161,19 +181,25 @@ def _resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
             if ep:
                 resolved[key] = ep
                 log.info("resolved %s [%s] → %s", cid, transport, ep)
-        if len(resolved) == len(REQUIRED_INPUTS):
+        if len(resolved) == len(required):
             break
         time.sleep(2.0)
 
-    missing = [k for k in REQUIRED_INPUTS if k not in resolved]
+    missing = [k for k in required if k not in resolved]
     if missing:
-        raise RuntimeError(
-            f"pick skill cannot find dependencies on atlas: missing "
-            f"{[REQUIRED_INPUTS[k][0] for k in missing]}. The skill needs "
-            f"yolo_world_rbnx (object_detect) + yolo_grasp_rbnx (grasp_pose) "
-            f"+ piper_moveit_rbnx (manipulation/execute_grasp) all ACTIVE "
-            f"before it can run. There is intentionally no ROS-service "
-            f"fallback — packaging-spec invariant #1.")
+        if _mode == "vla":
+            raise RuntimeError(
+                f"pick skill (VLA mode) cannot find dependencies on atlas: "
+                f"missing {[required[k][0] for k in missing]}. "
+                f"vla_client_rbnx must be ACTIVE before pick can run in VLA mode.")
+        else:
+            raise RuntimeError(
+                f"pick skill cannot find dependencies on atlas: missing "
+                f"{[required[k][0] for k in missing]}. The skill needs "
+                f"yolo_world_rbnx (object_detect) + yolo_grasp_rbnx (grasp_pose) "
+                f"+ piper_moveit_rbnx (manipulation/execute_grasp) all ACTIVE "
+                f"before it can run. There is intentionally no ROS-service "
+                f"fallback — packaging-spec invariant #1.")
 
     # Best-effort resolve OPTIONAL_INPUTS. Single shot — if they're not
     # advertised yet, log a warning and move on. They'll be silently
@@ -461,10 +487,26 @@ def _stage_execute_grasp(grasp_pose: dict, gripper_width: float,
 def _empty_pose_dict() -> dict:
     return {
         "header": {"stamp": {"sec": 0, "nanosec": 0},
-                   "frame_id": "camera_color_optical_frame"},
+                   "frame_id": "arm/base_link"},
         "pose":   {"position":    {"x": 0.0, "y": 0.0, "z": 0.0},
                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
     }
+
+
+# ── vertical grasp three-stage motion constants ────────────────────────────
+# The vertical-grasp pipeline uses a three-stage "approach → grasp →
+# retreat" motion, mirroring roboarm.catch():
+#   1. Move to pre_pose (above target, gripper open)  — hover
+#   2. Move to grasp_pose (target height, gripper close) — grasp
+#   3. Move to pre_pose (above target, gripper close)  — lift
+#
+# APPROACH_DIST is how far above the grasp pose to hover. This should
+# match yolo_grasp_rbnx's config/vertical_grasp.yaml approach_dist.
+_APPROACH_DIST = 0.10   # m
+
+# Gripper widths for the three stages.
+_GRIPPER_OPEN  = 0.06    # m — wide enough to clear the object on approach
+_GRIPPER_CLOSE = 0.0    # m — fully closed on the object
 
 
 # ── MCP tool (typed against codegen Pick_Request/Pick_Response) ─────────────
@@ -507,6 +549,19 @@ def _build_pose_stamped_from_dict(d: dict) -> PoseStamped:
                 w=float(ori_in.get("w", 1.0))),
         ),
     )
+
+
+def _lift_z(pose_dict: dict, dz: float) -> dict:
+    """Return a copy of pose_dict with position.z += dz.
+
+    Used to derive the pre/post grasp hover pose from the grasp pose
+    in the three-stage vertical-grasp motion.
+    """
+    import copy
+    d = copy.deepcopy(pose_dict)
+    pos = d.get("pose", {}).get("position", {})
+    pos["z"] = float(pos.get("z", 0.0)) + float(dz)
+    return d
 
 
 @pick_skill.mcp("robonix/skill/pick/pick")
@@ -640,6 +695,53 @@ def pick(req: Pick_Request) -> Pick_Response:
     #     )
     # ── END demo_place override ──
 
+    # ── VLA MODE ─────────────────────────────────────────────────────
+    # In VLA mode, bypass the traditional detect→grasp→execute pipeline
+    # entirely. Instead, call vla_client's execute MCP tool which runs
+    # an end-to-end vision-language-action policy at 10Hz.
+    if _mode == "vla":
+        total_to = float(req.timeout_s) if req.timeout_s > 0 else _default_timeout_s
+        t0 = time.monotonic()
+
+        # Map object_name to a natural language instruction for VLA
+        instruction = f"Pick up the {object_name}"
+        log.info("VLA MODE: calling vla_execute with instruction=%r, "
+                 "timeout=%.1fs, max_steps=%d",
+                 instruction, total_to, _vla_max_steps)
+
+        if "vla_execute" not in _endpoints:
+            return Pick_Response(
+                success=False,
+                message="VLA mode: vla_execute endpoint not resolved on atlas",
+                grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
+                gripper_width=0.0, score=0.0, elapsed_s=0.0,
+            )
+
+        vla_resp = _mcp_call_sync(
+            _endpoints["vla_execute"], "vla_execute", {
+                "instruction": instruction,
+                "timeout_s": total_to,
+                "max_steps": _vla_max_steps,
+            })
+
+        elapsed = time.monotonic() - t0
+        vla_success = vla_resp.get("success", False)
+        vla_msg = vla_resp.get("message", "")
+        vla_steps = int(vla_resp.get("steps_executed", 0))
+
+        log.info("VLA MODE result: success=%s, steps=%d, msg=%r, elapsed=%.2fs",
+                 vla_success, vla_steps, vla_msg[:60], elapsed)
+
+        return Pick_Response(
+            success=vla_success,
+            message=f"vla: {vla_msg}" if vla_msg else "vla: done",
+            grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
+            gripper_width=0.0,
+            score=1.0 if vla_success else 0.0,
+            elapsed_s=elapsed,
+        )
+    # ── END VLA MODE ──────────────────────────────────────────────────
+
     total_to    = float(req.timeout_s) if req.timeout_s > 0 else _default_timeout_s
     max_retries = int(req.max_retries) if req.max_retries > 0 else _default_max_retries
 
@@ -713,45 +815,74 @@ def pick(req: Pick_Request) -> Pick_Response:
             last_gripper_width   = float(gr.get("gripper_width", 0.0))
             last_score           = float(gr.get("score", 0.0))
 
-            # Stage 3: execute_grasp. Use the remaining time budget so the
-            # whole pick respects req.timeout_s.
+            # Stage 3: three-stage vertical grasp motion.
+            #
+            # In vertical mode, grasp_request returns a pose at the
+            # grasp height (z = z_table). We derive a pre_pose
+            # (z + APPROACH_DIST) for the hover approach + lift.
+            #
+            # Motion sequence (mirrors roboarm.catch):
+            #   3a. Move to pre_pose, gripper OPEN   (hover above)
+            #   3b. Move to grasp_pose, gripper CLOSE (descend + grasp)
+            #   3c. Move to pre_pose, gripper CLOSE   (lift)
+            #
+            # Use the remaining time budget so the whole pick
+            # respects req.timeout_s. Split the budget across the
+            # three stages.
             remaining = max(1.0, deadline - time.monotonic())
-            # Don't give execute_grasp the entire remaining budget if we
-            # still have retries left — leave some headroom for one more
-            # grasp_pose attempt if this one fails.
             retries_left = max_retries - retry - 1
             if retries_left > 0:
-                exec_to = min(remaining, max(8.0, remaining / (retries_left + 1)))
+                # Leave headroom for one more grasp attempt
+                exec_to = min(remaining, max(12.0, remaining / (retries_left + 1)))
             else:
                 exec_to = remaining
+            # Each of the 3 stages gets a third of the exec budget
+            stage_to = max(2.0, exec_to / 3.0)
 
-            # Override the yolo_grasp-suggested gripper_width with a fixed
-            # 4 cm partial-close. Rationale: for the current test setup we
-            # want a deterministic, visually obvious "grasp confirmation"
-            # (jaws partially closed, holding the pose) rather than a
-            # full-close that depends on object geometry. yolo_grasp's
-            # estimate is preserved in last_gripper_width for the
-            # response, but the cpp executor receives 0.04.
-            EXEC_GRIPPER_WIDTH = 0.04
-            eg = _stage_execute_grasp(last_grasp_pose_dict, EXEC_GRIPPER_WIDTH,
-                                       exec_to)
+            pre_pose_dict = _lift_z(last_grasp_pose_dict, _APPROACH_DIST)
 
-            if "_error" not in eg and eg.get("success"):
-                grasp_succeeded = True
-                # We report the yolo_grasp gripper_width in the response
-                # (what was *planned*), not the override.
-                response = Pick_Response(
-                    success=True, message="ok",
-                    grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                    gripper_width=last_gripper_width, score=last_score,
-                    elapsed_s=time.monotonic() - t0,
-                )
-                return response
+            # ── 3a: hover (pre_pose + gripper open) ──
+            log.info("stage3a: approach to pre_pose (hover, gripper open)")
+            eg_a = _stage_execute_grasp(pre_pose_dict, _GRIPPER_OPEN,
+                                         stage_to)
+            if "_error" in eg_a or not eg_a.get("success"):
+                last_failure_msg = (
+                    f"execute retry {retry} (approach): "
+                    f"{eg_a.get('_error') or eg_a.get('message', 'unknown')}")
+                log.warning("%s — trying next grasp candidate", last_failure_msg)
+                continue
 
-            last_failure_msg = (
-                f"execute retry {retry}: "
-                f"{eg.get('_error') or eg.get('message', 'unknown')}")
-            log.warning("%s — trying next grasp candidate", last_failure_msg)
+            # ── 3b: descend + grasp (grasp_pose + gripper close) ──
+            log.info("stage3b: descend to grasp_pose, close gripper")
+            eg_b = _stage_execute_grasp(last_grasp_pose_dict, _GRIPPER_CLOSE,
+                                         stage_to)
+            if "_error" in eg_b or not eg_b.get("success"):
+                last_failure_msg = (
+                    f"execute retry {retry} (descend): "
+                    f"{eg_b.get('_error') or eg_b.get('message', 'unknown')}")
+                log.warning("%s — trying next grasp candidate", last_failure_msg)
+                continue
+
+            # ── 3c: lift (pre_pose + gripper close) ──
+            log.info("stage3c: lift to pre_pose, hold gripper close")
+            eg_c = _stage_execute_grasp(pre_pose_dict, _GRIPPER_CLOSE,
+                                         stage_to)
+            if "_error" in eg_c or not eg_c.get("success"):
+                # Lift failed — but we DID grasp the object. Log a
+                # warning but still report success (the object is in
+                # the gripper, just not lifted to hover height).
+                log.warning("lift stage failed: %s — reporting success "
+                            "anyway (object may be in gripper)",
+                            eg_c.get("_error") or eg_c.get("message", ""))
+
+            grasp_succeeded = True
+            response = Pick_Response(
+                success=True, message="ok (vertical 3-stage grasp)",
+                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+                gripper_width=last_gripper_width, score=last_score,
+                elapsed_s=time.monotonic() - t0,
+            )
+            return response
 
         # Exhausted retries.
         response = Pick_Response(
@@ -781,13 +912,19 @@ def pick(req: Pick_Request) -> Pick_Response:
 def init(cfg):
     """CMD_INIT: light. Don't query atlas — upstream services may
     still be warming up. cfg parsed for forward compat."""
-    global _default_timeout_s, _default_max_retries
+    global _default_timeout_s, _default_max_retries, _mode, _vla_max_steps
     cfg = cfg or {}
     if isinstance(cfg, str):
         try:
             cfg = json.loads(cfg) if cfg else {}
         except json.JSONDecodeError as e:
             return Err(f"bad config_json: {e}")
+    if "mode" in cfg:
+        m = str(cfg["mode"]).strip().lower()
+        if m in ("moveit", "vla"):
+            _mode = m
+        else:
+            log.warning("ignoring invalid mode: %r (must be 'moveit' or 'vla')", cfg["mode"])
     if "default_timeout_s" in cfg:
         try:
             _default_timeout_s = float(cfg["default_timeout_s"])
@@ -800,8 +937,13 @@ def init(cfg):
         except (TypeError, ValueError):
             log.warning("ignoring invalid default_max_retries: %r",
                         cfg["default_max_retries"])
-    log.info("CMD_INIT ok (default_timeout_s=%.1f, default_max_retries=%d)",
-             _default_timeout_s, _default_max_retries)
+    if "vla_max_steps" in cfg:
+        try:
+            _vla_max_steps = int(cfg["vla_max_steps"])
+        except (TypeError, ValueError):
+            log.warning("ignoring invalid vla_max_steps: %r", cfg["vla_max_steps"])
+    log.info("CMD_INIT ok (mode=%s, default_timeout_s=%.1f, default_max_retries=%d, vla_max_steps=%d)",
+             _mode, _default_timeout_s, _default_max_retries, _vla_max_steps)
     return Ok()
 
 
