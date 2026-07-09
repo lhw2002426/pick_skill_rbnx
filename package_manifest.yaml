@@ -40,10 +40,8 @@
 #   mode                 default "moveit" — "moveit" uses traditional
 #                                           detect+grasp+execute pipeline;
 #                                           "vla" uses VLA end-to-end policy
-#   default_timeout_s    default 60.0  — total budget when caller
-#                                         passes timeout_s=0
-#   default_max_retries  default 5     — grasp_pose retries when
-#                                         caller passes max_retries=0
+#   The pick tool takes only object_name. The total budget is fixed
+#   at 60 s and the skill makes one grasp attempt.
 #   vla_max_steps        default 50    — max inference steps in VLA mode
 manifestVersion: 1
 

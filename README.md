@@ -104,36 +104,26 @@ for piper_moveit_rbnx).
    `success=False` (object not in view, low confidence, etc.):
    short-circuit return `detection_failed: <message>`.
 
-2. **Retry loop**, up to `req.max_retries` times (default 5, same
-   as upstream pick.py):
+2. **Stage 2** — `grasp_request(name, bbox_2d, object_center_3d, retry=0)`.
+   The downstream grasp service still accepts a retry index; pick now
+   always passes `0` and makes exactly one grasp attempt.
 
-   a. **Stage 2** — `grasp_request(name, bbox_2d, object_center_3d, retry)`.
-      Each retry value lets yolo_grasp pick a different grasp
-      candidate. If `success=False`: log + continue.
+3. **Stage 3** — `execute_grasp(grasp_pose, gripper_width, exec_timeout)`.
+   The execute_grasp service itself does the busy/idle wait on
+   `/arm/arm_status`, so we don't need to. Returns once the arm
+   hit busy → idle (success) or budget exhausted (timeout).
 
-   b. **Stage 3** — `execute_grasp(grasp_pose, gripper_width, exec_timeout)`.
-      The execute_grasp service itself does the busy/idle wait on
-      `/arm/arm_status`, so we don't need to. Returns once the arm
-      hit busy → idle (success) or budget exhausted (timeout).
-
-   c. If success → return immediately.
-   d. If failure → log + next retry.
-
-3. After the budget or retry limit: return
-   `all_N_retries_failed; last: <message>`.
+4. If the single attempt fails, return
+   `grasp attempt failed; last: <message>`.
 
 ## Time budgeting
 
-`req.timeout_s` is the **total** budget for the whole pick. Internally
-distributed:
+The total pick budget is fixed at 60 s. Internally distributed:
 
 * Detection: bounded by FastMCP client timeout (~5–10s typical).
-* Per-grasp_request: also FastMCP-bounded.
-* Per-execute_grasp: `min(remaining_budget, max(8s, remaining/(retries_left+1)))` —
-  reserve some headroom for retries unless this is the last attempt.
-
-If the caller passes `timeout_s=0`, we use `default_timeout_s`
-(60s by default; tunable via deploy manifest config).
+* Grasp request: also FastMCP-bounded.
+* Execute grasp: the remaining budget is split across the three
+  vertical-grasp execution stages.
 
 ## Config
 
@@ -141,12 +131,11 @@ If the caller passes `timeout_s=0`, we use `default_timeout_s`
 skill:
   - name: pick
     config:
-      default_timeout_s:    60.0      # used when caller passes 0
-      default_max_retries:  5         # used when caller passes 0
+      gripper_open_width: 0.08
 ```
 
-Both optional. `pick(timeout_s, max_retries)` arguments override
-these per-call.
+The `pick` MCP tool accepts only `object_name`; timeout and retry
+count are not caller-configurable.
 
 ## Build / run
 
@@ -188,7 +177,7 @@ curl -s http://127.0.0.1:<pick_skill_port>/mcp/ \
       "method":"tools/call",
       "params":{
         "name":"pick",
-        "arguments":{"object_name":"comb","timeout_s":60.0,"max_retries":5}
+        "arguments":{"object_name":"comb"}
       }
     }'
 # Find the port via `rbnx caps -v` or the package's start log.
@@ -200,10 +189,10 @@ curl -s http://127.0.0.1:<pick_skill_port>/mcp/ \
 |---|---|---|
 | `pick skill cannot find dependencies on atlas: missing [...]` | one of yolo_world / yolo_grasp / piper_moveit not ACTIVE | `rbnx caps` to see which one's missing; check that package's log |
 | `detection_failed: object 'X' not found at confidence ≥ 0.2` | YOLOE genuinely doesn't see the object | move closer; try a different object_name; check `/yolo/detect_object` independently |
-| `grasp_pose retry N: PLACEHOLDER` repeating | yolo_grasp_rbnx still in PLACEHOLDER mode (real estimator not wired) | see yolo_grasp_rbnx README "Cutover steps" |
-| `execute retry 0: timeout: arm_status never went busy` | piper_moveit/cpp didn't pick up the GraspPose, OR /arm/arm_status not flowing | check piper_ctl_rbnx ACTIVE + `ros2 topic info /graspnet/grasps` |
+| `grasp_pose failed: PLACEHOLDER` | yolo_grasp_rbnx still in PLACEHOLDER mode (real estimator not wired) | see yolo_grasp_rbnx README "Cutover steps" |
+| `execute failed (approach): timeout: arm_status never went busy` | manipulation provider didn't pick up the GraspPose, OR /arm/arm_status not flowing | check piper_ctl_rbnx ACTIVE + manipulation provider logs |
 | `pick skill not active` on first call | CMD_ACTIVATE failed — atlas_bridge logs the actual reason | check pick_skill log; usually means upstream service down |
-| Hangs for full timeout | one of the upstream MCP servers is reachable but not responding | check the slow service's log; FastMCP client doesn't have an aggressive per-call timeout, the test harness's `timeout_s` is the only ceiling |
+| Hangs for full timeout | one of the upstream MCP servers is reachable but not responding | check the slow service's log; the pick budget is fixed at 60 s |
 
 ## Coupling with neighbors
 

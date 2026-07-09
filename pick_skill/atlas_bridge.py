@@ -13,28 +13,26 @@ ROS topic / service names):
                   ┌────────── 1. detect_object ─────────────►  yolo_world_rbnx
                   │            (object_name → bbox + 3D center)
                   ▼
-                  for retry in 0..N:
-                      ┌──── 2. grasp_request ────►  yolo_grasp_rbnx
-                      │       (name + bbox + center + retry → grasp_pose)
+                  ┌──── 2. grasp_request ────►  yolo_grasp_rbnx
+                  │       (name + bbox + center + retry=0 → grasp_pose)
                       │
                       ▼
                       ┌──── 3. execute_grasp ────►  piper_moveit_rbnx
-                      │       (grasp_pose + gripper_width=0.04 + timeout)
-                      │       (overrides yolo_grasp's suggested width to
-                      │        a fixed 4 cm partial-close)
+                      │       (pre_pose + gripper full-open,
+                      │        grasp_pose + gripper closed,
+                      │        lift + gripper closed)
                       │
                       ▼
-                      success → sleep 2s (visual confirmation)
+                      success → verify gripper did not close past threshold
+                                → sleep 2s (visual confirmation)
                                 → 4. reset (post-pick park)
                                        ──────►  piper_moveit_rbnx
                                        (open gripper + moveArmtoInit)
                                 → return success
-                      failure → next retry (different grasp candidate)
-
-                  After loop exit (timeout / retries exhausted /
-                  detection failure): also call reset before returning,
-                  so cpp's sticky state machine flags (is_busy_, …)
-                  don't silently break the NEXT pick.
+                  On timeout, execution failure, or detection failure:
+                  also call reset before returning, so cpp's sticky
+                  state machine flags (is_busy_, …) don't silently
+                  break the NEXT pick.
 
 Why MCP-everywhere instead of mixing in raw ROS service calls (the
 upstream pick.py path):
@@ -47,7 +45,9 @@ upstream pick.py path):
   topic names don't.
 * No /arm/arm_status polling here — execute_grasp already does that
   internally (Stage 5 piper_moveit_rbnx) and only returns once the
-  arm has hit busy → idle. We just await its response.
+  arm has hit busy → idle. We do subscribe to /arm/joint_states_single
+  to verify the gripper did not close completely after the grasp,
+  mirroring roboarm's "closed too far means empty" success check.
 
 Lifecycle (Skill — lazy activate, same as explore_rbnx):
     on_init      — light. State machine reaches INITIALIZED at boot.
@@ -90,9 +90,14 @@ _state_lock = threading.Lock()
 # Resolved upstream MCP endpoints. None until on_activate completes.
 # Three keys, three contract ids — see REQUIRED_INPUTS below.
 _endpoints: Optional[dict[str, str]] = None
-_default_timeout_s   = 30.0
-_default_max_retries = 5
+_DEFAULT_TIMEOUT_S   = 60.0
 _vla_max_steps       = 50
+_gripper_open_width  = 0.08
+_gripper_close_width = 0.0
+_gripper_grasp_threshold_width = 0.005
+_gripper_feedback_timeout_s = 2.0
+_gripper_joint_states_topic = "/arm/joint_states_single"
+_require_gripper_feedback = True
 
 # Execution mode: "moveit" (traditional pipeline) or "vla" (end-to-end policy)
 _mode = "moveit"
@@ -105,6 +110,13 @@ _mode = "moveit"
 # overhead), so we cache the URL→Client mapping and reuse.
 _mcp_clients_lock = threading.Lock()
 _mcp_clients: dict[str, Any] = {}   # base_url → fastmcp.Client
+
+_gripper_state_lock = threading.Lock()
+_gripper_latest_width: Optional[float] = None
+_gripper_latest_seen_mono: Optional[float] = None
+_gripper_monitor_node: Any = None
+_gripper_monitor_thread: Optional[threading.Thread] = None
+_gripper_monitor_stop = threading.Event()
 
 
 # ── atlas-resolved upstream contracts ───────────────────────────────────────
@@ -321,12 +333,149 @@ def _mcp_call_sync(url: str, tool: str, args: dict) -> dict:
         _mcp_call(url, tool, args), loop)
     try:
         # No timeout here — pipeline stages enforce their own budgets
-        # via the outer pick(timeout_s) total. If a single MCP RPC
+        # via the outer pick timeout budget. If a single MCP RPC
         # hangs forever we'd want a watchdog at a higher layer.
         return fut.result()
     except Exception as e:  # noqa: BLE001
         log.warning("mcp call %s failed: %s", tool, e)
         return {"_error": str(e)}
+
+
+# ── gripper feedback monitor ───────────────────────────────────────────────
+def _joint_state_gripper_width(msg: Any) -> Optional[float]:
+    """Extract the actual gripper opening width from JointState.
+
+    piper_ctl publishes /arm/joint_states_single with names
+    joint1..joint6, gripper, and position[6] is the Piper gripper
+    opening in meters. Accept joint7 too for compatibility with
+    MoveIt naming.
+    """
+    names = list(getattr(msg, "name", []) or [])
+    positions = list(getattr(msg, "position", []) or [])
+    if not positions:
+        return None
+    idx: Optional[int] = None
+    for candidate in ("gripper", "joint7"):
+        if candidate in names:
+            idx = names.index(candidate)
+            break
+    if idx is None and len(positions) >= 7:
+        idx = 6
+    if idx is None or idx >= len(positions):
+        return None
+    try:
+        width = float(positions[idx])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(width):
+        return None
+    return max(0.0, width)
+
+
+def _start_gripper_monitor() -> None:
+    """Start a small rclpy subscriber for /arm/joint_states_single.
+
+    The skill remains MCP-first for orchestration, but the gripper
+    success signal is only available as ROS JointState feedback today.
+    If ROS is unavailable, leave the monitor stopped; the pick path
+    will fail at verification time when feedback is required.
+    """
+    global _gripper_monitor_node, _gripper_monitor_thread
+    if _gripper_monitor_thread is not None and _gripper_monitor_thread.is_alive():
+        return
+    try:
+        import rclpy
+        from rclpy.node import Node
+        from sensor_msgs.msg import JointState
+    except Exception as e:  # noqa: BLE001
+        log.warning("gripper feedback monitor unavailable: %s", e)
+        return
+
+    _gripper_monitor_stop.clear()
+
+    class _GripperMonitor(Node):
+        def __init__(self) -> None:
+            super().__init__("pick_skill_gripper_feedback")
+            self.create_subscription(
+                JointState, _gripper_joint_states_topic, self._cb, 10)
+
+        def _cb(self, msg: Any) -> None:
+            width = _joint_state_gripper_width(msg)
+            if width is None:
+                return
+            with _gripper_state_lock:
+                global _gripper_latest_width, _gripper_latest_seen_mono
+                _gripper_latest_width = width
+                _gripper_latest_seen_mono = time.monotonic()
+
+    def _runner() -> None:
+        global _gripper_monitor_node
+        try:
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            node = _GripperMonitor()
+            _gripper_monitor_node = node
+            log.info("gripper feedback monitor subscribed to %s",
+                     _gripper_joint_states_topic)
+            while rclpy.ok() and not _gripper_monitor_stop.is_set():
+                rclpy.spin_once(node, timeout_sec=0.1)
+            node.destroy_node()
+        except Exception as e:  # noqa: BLE001
+            log.warning("gripper feedback monitor stopped: %s", e)
+        finally:
+            _gripper_monitor_node = None
+
+    _gripper_monitor_thread = threading.Thread(
+        target=_runner, name="pick-skill-gripper-feedback", daemon=True)
+    _gripper_monitor_thread.start()
+
+
+def _stop_gripper_monitor() -> None:
+    global _gripper_monitor_thread
+    _gripper_monitor_stop.set()
+    thread = _gripper_monitor_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=1.0)
+    _gripper_monitor_thread = None
+
+
+def _wait_for_gripper_width_after(start_mono: float,
+                                  timeout_s: float) -> Optional[float]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        with _gripper_state_lock:
+            width = _gripper_latest_width
+            seen = _gripper_latest_seen_mono
+        if width is not None and seen is not None and seen >= start_mono:
+            return width
+        time.sleep(0.05)
+    return None
+
+
+def _verify_gripper_holding(close_started_mono: float) -> tuple[bool, str, float]:
+    width = _wait_for_gripper_width_after(
+        close_started_mono, _gripper_feedback_timeout_s)
+    if width is None:
+        msg = (
+            f"no gripper feedback on {_gripper_joint_states_topic} within "
+            f"{_gripper_feedback_timeout_s:.1f}s"
+        )
+        if _require_gripper_feedback:
+            return False, msg, 0.0
+        return True, msg + " (ignored)", 0.0
+    if width < _gripper_grasp_threshold_width:
+        return (
+            False,
+            f"gripper closed to {width:.4f}m < "
+            f"{_gripper_grasp_threshold_width:.4f}m threshold; likely empty",
+            width,
+        )
+    return (
+        True,
+        f"gripper held at {width:.4f}m >= "
+        f"{_gripper_grasp_threshold_width:.4f}m threshold",
+        width,
+    )
 
 
 # ── pipeline stages ─────────────────────────────────────────────────────────
@@ -505,8 +654,8 @@ def _empty_pose_dict() -> dict:
 _APPROACH_DIST = 0.10   # m
 
 # Gripper widths for the three stages.
-_GRIPPER_OPEN  = 0.06    # m — wide enough to clear the object on approach
-_GRIPPER_CLOSE = 0.0    # m — fully closed on the object
+_GRIPPER_OPEN  = _gripper_open_width
+_GRIPPER_CLOSE = _gripper_close_width
 
 
 # ── MCP tool (typed against codegen Pick_Request/Pick_Response) ─────────────
@@ -700,7 +849,7 @@ def pick(req: Pick_Request) -> Pick_Response:
     # entirely. Instead, call vla_client's execute MCP tool which runs
     # an end-to-end vision-language-action policy at 10Hz.
     if _mode == "vla":
-        total_to = float(req.timeout_s) if req.timeout_s > 0 else _default_timeout_s
+        total_to = _DEFAULT_TIMEOUT_S
         t0 = time.monotonic()
 
         # Map object_name to a natural language instruction for VLA
@@ -742,24 +891,10 @@ def pick(req: Pick_Request) -> Pick_Response:
         )
     # ── END VLA MODE ──────────────────────────────────────────────────
 
-    total_to    = float(req.timeout_s) if req.timeout_s > 0 else _default_timeout_s
-    max_retries = int(req.max_retries) if req.max_retries > 0 else _default_max_retries
+    total_to = _DEFAULT_TIMEOUT_S
 
     t0 = time.monotonic()
     deadline = t0 + total_to
-
-    # NOTE: pre-grasp reset has been REMOVED (was Stage 0 here).
-    # New policy: reset runs AFTER pick(), regardless of outcome
-    # (success / detection_failed / timeout / retries exhausted /
-    # uncaught exception). We achieve this with a single try/finally
-    # that wraps the entire pipeline, so we cannot accidentally miss
-    # a reset on some new failure path. The first pick of a fresh
-    # boot still doesn't strictly need pre-grasp reset because cpp's
-    # __init__ already does controlGripper(0.12) + moveArmtoInit();
-    # subsequent picks are preceded by the post-pick reset of the
-    # PREVIOUS call. The 2s "hold the grasp pose for visual
-    # confirmation" only fires on success — failure paths reset
-    # immediately, no pose-hold.
 
     response: Pick_Response = Pick_Response(
         success=False, message="pick aborted before any stage ran",
@@ -769,6 +904,24 @@ def pick(req: Pick_Request) -> Pick_Response:
     grasp_succeeded = False
 
     try:
+        # Stage 0: park at the fixed observation pose before taking the
+        # detector image. The 2D hand-eye homography is valid only from this
+        # repeatable eye-in-hand camera pose.
+        if "reset" in _endpoints:
+            log.info("stage0 reset to fixed observation pose before detection")
+            rst = _stage_reset()
+            if not rst.get("success", False):
+                msg = rst.get("_error") or rst.get("message", "unknown")
+                response = Pick_Response(
+                    success=False, message=f"pre_pick_reset_failed: {msg}",
+                    grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
+                    gripper_width=0.0, score=0.0,
+                    elapsed_s=time.monotonic() - t0,
+                )
+                return response
+        else:
+            log.warning("stage0 reset skipped — manipulation/reset not resolved")
+
         # ── Stage 1: detect_object ─────────────────────────────────────────
         det = _stage_detect_object(object_name)
         if "_error" in det or not det.get("success"):
@@ -784,124 +937,142 @@ def pick(req: Pick_Request) -> Pick_Response:
         bbox_2d   = list(det.get("bbox_2d") or [])
         center_3d = list(det.get("object_center_3d") or [])
 
-        # ── Stage 2 + 3: grasp_request → execute_grasp, retry on failure ──
+        # ── Stage 2 + 3: grasp_request → execute_grasp, single attempt ──
         last_grasp_pose_dict: dict = _empty_pose_dict()
         last_gripper_width   = 0.0
         last_score           = 0.0
         last_failure_msg     = "no attempts made"
 
-        for retry in range(max_retries):
-            if time.monotonic() >= deadline:
-                response = Pick_Response(
-                    success=False,
-                    message=(f"timeout: budget {total_to:.1f}s exhausted "
-                             f"before retry {retry}"),
-                    grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                    gripper_width=last_gripper_width, score=last_score,
-                    elapsed_s=time.monotonic() - t0,
-                )
-                return response
-
-            # Stage 2: grasp_request.
-            gr = _stage_grasp_request(object_name, bbox_2d, center_3d, retry)
-            if "_error" in gr or not gr.get("success"):
-                last_failure_msg = (
-                    f"grasp_pose retry {retry}: "
-                    f"{gr.get('_error') or gr.get('message', 'unknown')}")
-                log.warning("%s — trying next", last_failure_msg)
-                continue
-
-            last_grasp_pose_dict = gr.get("grasp_pose") or _empty_pose_dict()
-            last_gripper_width   = float(gr.get("gripper_width", 0.0))
-            last_score           = float(gr.get("score", 0.0))
-
-            # Stage 3: three-stage vertical grasp motion.
-            #
-            # In vertical mode, grasp_request returns a pose at the
-            # grasp height (z = z_table). We derive a pre_pose
-            # (z + APPROACH_DIST) for the hover approach + lift.
-            #
-            # Motion sequence (mirrors roboarm.catch):
-            #   3a. Move to pre_pose, gripper OPEN   (hover above)
-            #   3b. Move to grasp_pose, gripper CLOSE (descend + grasp)
-            #   3c. Move to pre_pose, gripper CLOSE   (lift)
-            #
-            # Use the remaining time budget so the whole pick
-            # respects req.timeout_s. Split the budget across the
-            # three stages.
-            remaining = max(1.0, deadline - time.monotonic())
-            retries_left = max_retries - retry - 1
-            if retries_left > 0:
-                # Leave headroom for one more grasp attempt
-                exec_to = min(remaining, max(12.0, remaining / (retries_left + 1)))
-            else:
-                exec_to = remaining
-            # Each of the 3 stages gets a third of the exec budget
-            stage_to = max(2.0, exec_to / 3.0)
-
-            pre_pose_dict = _lift_z(last_grasp_pose_dict, _APPROACH_DIST)
-
-            # ── 3a: hover (pre_pose + gripper open) ──
-            log.info("stage3a: approach to pre_pose (hover, gripper open)")
-            eg_a = _stage_execute_grasp(pre_pose_dict, _GRIPPER_OPEN,
-                                         stage_to)
-            if "_error" in eg_a or not eg_a.get("success"):
-                last_failure_msg = (
-                    f"execute retry {retry} (approach): "
-                    f"{eg_a.get('_error') or eg_a.get('message', 'unknown')}")
-                log.warning("%s — trying next grasp candidate", last_failure_msg)
-                continue
-
-            # ── 3b: descend + grasp (grasp_pose + gripper close) ──
-            log.info("stage3b: descend to grasp_pose, close gripper")
-            eg_b = _stage_execute_grasp(last_grasp_pose_dict, _GRIPPER_CLOSE,
-                                         stage_to)
-            if "_error" in eg_b or not eg_b.get("success"):
-                last_failure_msg = (
-                    f"execute retry {retry} (descend): "
-                    f"{eg_b.get('_error') or eg_b.get('message', 'unknown')}")
-                log.warning("%s — trying next grasp candidate", last_failure_msg)
-                continue
-
-            # ── 3c: lift (pre_pose + gripper close) ──
-            log.info("stage3c: lift to pre_pose, hold gripper close")
-            eg_c = _stage_execute_grasp(pre_pose_dict, _GRIPPER_CLOSE,
-                                         stage_to)
-            if "_error" in eg_c or not eg_c.get("success"):
-                # Lift failed — but we DID grasp the object. Log a
-                # warning but still report success (the object is in
-                # the gripper, just not lifted to hover height).
-                log.warning("lift stage failed: %s — reporting success "
-                            "anyway (object may be in gripper)",
-                            eg_c.get("_error") or eg_c.get("message", ""))
-
-            grasp_succeeded = True
+        if time.monotonic() >= deadline:
             response = Pick_Response(
-                success=True, message="ok (vertical 3-stage grasp)",
+                success=False,
+                message=f"timeout: budget {total_to:.1f}s exhausted before grasp attempt",
                 grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
                 gripper_width=last_gripper_width, score=last_score,
                 elapsed_s=time.monotonic() - t0,
             )
             return response
 
-        # Exhausted retries.
+        # Stage 2: grasp_request. The downstream contract still accepts a
+        # retry index; pass 0 because pick no longer retries.
+        gr = _stage_grasp_request(object_name, bbox_2d, center_3d, 0)
+        if "_error" in gr or not gr.get("success"):
+            last_failure_msg = (
+                f"grasp_pose failed: "
+                f"{gr.get('_error') or gr.get('message', 'unknown')}")
+            log.warning("%s", last_failure_msg)
+            response = Pick_Response(
+                success=False,
+                message=f"grasp attempt failed; last: {last_failure_msg}",
+                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+                gripper_width=last_gripper_width, score=last_score,
+                elapsed_s=time.monotonic() - t0,
+            )
+            return response
+
+        last_grasp_pose_dict = gr.get("grasp_pose") or _empty_pose_dict()
+        last_gripper_width   = float(gr.get("gripper_width", 0.0))
+        last_score           = float(gr.get("score", 0.0))
+
+        # Stage 3: three-stage vertical grasp motion.
+        #
+        # In vertical mode, grasp_request returns a pose at the
+        # grasp height (z = z_table). We derive a pre_pose
+        # (z + APPROACH_DIST) for the hover approach + lift.
+        #
+        # Motion sequence (mirrors roboarm.catch):
+        #   3a. Move to pre_pose, gripper OPEN   (hover above)
+        #   3b. Move to grasp_pose, gripper CLOSE (descend + grasp)
+        #   3c. Move to pre_pose, gripper CLOSE   (lift)
+        #
+        # Use the remaining time budget so the whole pick respects the fixed
+        # 60 s timeout. Each of the three execution stages gets a third.
+        remaining = max(1.0, deadline - time.monotonic())
+        stage_to = max(2.0, remaining / 3.0)
+
+        pre_pose_dict = _lift_z(last_grasp_pose_dict, _APPROACH_DIST)
+
+        # ── 3a: hover (pre_pose + gripper open) ──
+        log.info("stage3a: approach to pre_pose (hover, gripper open)")
+        eg_a = _stage_execute_grasp(pre_pose_dict, _GRIPPER_OPEN, stage_to)
+        if "_error" in eg_a or not eg_a.get("success"):
+            last_failure_msg = (
+                f"execute failed (approach): "
+                f"{eg_a.get('_error') or eg_a.get('message', 'unknown')}")
+            log.warning("%s", last_failure_msg)
+            response = Pick_Response(
+                success=False,
+                message=f"grasp attempt failed; last: {last_failure_msg}",
+                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+                gripper_width=last_gripper_width, score=last_score,
+                elapsed_s=time.monotonic() - t0,
+            )
+            return response
+
+        # ── 3b: descend + grasp (grasp_pose + gripper close) ──
+        log.info("stage3b: descend to grasp_pose, close gripper")
+        close_started_mono = time.monotonic()
+        eg_b = _stage_execute_grasp(last_grasp_pose_dict, _GRIPPER_CLOSE,
+                                    stage_to)
+        if "_error" in eg_b or not eg_b.get("success"):
+            last_failure_msg = (
+                f"execute failed (descend): "
+                f"{eg_b.get('_error') or eg_b.get('message', 'unknown')}")
+            log.warning("%s", last_failure_msg)
+            response = Pick_Response(
+                success=False,
+                message=f"grasp attempt failed; last: {last_failure_msg}",
+                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+                gripper_width=last_gripper_width, score=last_score,
+                elapsed_s=time.monotonic() - t0,
+            )
+            return response
+
+        # ── 3c: lift (pre_pose + gripper close) ──
+        log.info("stage3c: lift to pre_pose, hold gripper close")
+        eg_c = _stage_execute_grasp(pre_pose_dict, _GRIPPER_CLOSE, stage_to)
+        if "_error" in eg_c or not eg_c.get("success"):
+            # Lift failed — but we DID grasp the object. Log a warning but
+            # still report success (the object is in the gripper, just not
+            # lifted to hover height).
+            log.warning("lift stage failed: %s — reporting success anyway "
+                        "(object may be in gripper)",
+                        eg_c.get("_error") or eg_c.get("message", ""))
+
+        holding_ok, holding_msg, measured_gripper_width = (
+            _verify_gripper_holding(close_started_mono)
+        )
+        if not holding_ok:
+            last_failure_msg = f"gripper verification failed: {holding_msg}"
+            log.warning("%s", last_failure_msg)
+            response = Pick_Response(
+                success=False,
+                message=f"grasp attempt failed; last: {last_failure_msg}",
+                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
+                gripper_width=last_gripper_width, score=last_score,
+                elapsed_s=time.monotonic() - t0,
+            )
+            return response
+        log.info("gripper verification ok: %s", holding_msg)
+
+        grasp_succeeded = True
         response = Pick_Response(
-            success=False,
-            message=f"all {max_retries} retries failed; last: {last_failure_msg}",
+            success=True,
+            message=f"ok (vertical 3-stage grasp; {holding_msg})",
             grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-            gripper_width=last_gripper_width, score=last_score,
+            gripper_width=measured_gripper_width, score=last_score,
             elapsed_s=time.monotonic() - t0,
         )
         return response
     finally:
         # Single chokepoint: every pick() exit path lands here.
-        # On success: 2s pose-hold for visual confirmation, then reset.
+        # On success: 10s pose-hold for visual confirmation, then reset.
         # On failure: reset immediately, no hold.
         # Either way, cpp ends up with clean state machine + arm at
         # init pose + gripper open, ready for the next pick.
         if grasp_succeeded:
-            log.info("grasp successful — holding pose 2.0s before post-pick reset")
-            time.sleep(2.0)
+            log.info("grasp successful — holding pose 10.0s before post-pick reset")
+            time.sleep(10.0)
             _safe_post_pick_reset("after success")
         else:
             _safe_post_pick_reset("after failure")
@@ -912,7 +1083,11 @@ def pick(req: Pick_Request) -> Pick_Response:
 def init(cfg):
     """CMD_INIT: light. Don't query atlas — upstream services may
     still be warming up. cfg parsed for forward compat."""
-    global _default_timeout_s, _default_max_retries, _mode, _vla_max_steps
+    global _mode, _vla_max_steps
+    global _gripper_open_width, _gripper_close_width
+    global _gripper_grasp_threshold_width, _gripper_feedback_timeout_s
+    global _gripper_joint_states_topic, _require_gripper_feedback
+    global _GRIPPER_OPEN, _GRIPPER_CLOSE
     cfg = cfg or {}
     if isinstance(cfg, str):
         try:
@@ -925,25 +1100,57 @@ def init(cfg):
             _mode = m
         else:
             log.warning("ignoring invalid mode: %r (must be 'moveit' or 'vla')", cfg["mode"])
-    if "default_timeout_s" in cfg:
-        try:
-            _default_timeout_s = float(cfg["default_timeout_s"])
-        except (TypeError, ValueError):
-            log.warning("ignoring invalid default_timeout_s: %r",
-                        cfg["default_timeout_s"])
-    if "default_max_retries" in cfg:
-        try:
-            _default_max_retries = int(cfg["default_max_retries"])
-        except (TypeError, ValueError):
-            log.warning("ignoring invalid default_max_retries: %r",
-                        cfg["default_max_retries"])
     if "vla_max_steps" in cfg:
         try:
             _vla_max_steps = int(cfg["vla_max_steps"])
         except (TypeError, ValueError):
             log.warning("ignoring invalid vla_max_steps: %r", cfg["vla_max_steps"])
-    log.info("CMD_INIT ok (mode=%s, default_timeout_s=%.1f, default_max_retries=%d, vla_max_steps=%d)",
-             _mode, _default_timeout_s, _default_max_retries, _vla_max_steps)
+    if "gripper_open_width" in cfg:
+        try:
+            _gripper_open_width = float(cfg["gripper_open_width"])
+        except (TypeError, ValueError):
+            log.warning("ignoring invalid gripper_open_width: %r",
+                        cfg["gripper_open_width"])
+    if "gripper_close_width" in cfg:
+        try:
+            _gripper_close_width = float(cfg["gripper_close_width"])
+        except (TypeError, ValueError):
+            log.warning("ignoring invalid gripper_close_width: %r",
+                        cfg["gripper_close_width"])
+    if "gripper_grasp_threshold_width" in cfg:
+        try:
+            _gripper_grasp_threshold_width = float(
+                cfg["gripper_grasp_threshold_width"])
+        except (TypeError, ValueError):
+            log.warning("ignoring invalid gripper_grasp_threshold_width: %r",
+                        cfg["gripper_grasp_threshold_width"])
+    if "gripper_feedback_timeout_s" in cfg:
+        try:
+            _gripper_feedback_timeout_s = float(
+                cfg["gripper_feedback_timeout_s"])
+        except (TypeError, ValueError):
+            log.warning("ignoring invalid gripper_feedback_timeout_s: %r",
+                        cfg["gripper_feedback_timeout_s"])
+    if "gripper_joint_states_topic" in cfg:
+        _gripper_joint_states_topic = str(cfg["gripper_joint_states_topic"])
+    if "require_gripper_feedback" in cfg:
+        _require_gripper_feedback = bool(cfg["require_gripper_feedback"])
+
+    _gripper_open_width = max(0.0, _gripper_open_width)
+    _gripper_close_width = max(0.0, _gripper_close_width)
+    _gripper_grasp_threshold_width = max(0.0, _gripper_grasp_threshold_width)
+    _gripper_feedback_timeout_s = max(0.1, _gripper_feedback_timeout_s)
+    _GRIPPER_OPEN = _gripper_open_width
+    _GRIPPER_CLOSE = _gripper_close_width
+
+    log.info(
+        "CMD_INIT ok (mode=%s, timeout_s=%.1f, "
+        "grasp_attempts=1, vla_max_steps=%d, gripper_open=%.3f, "
+        "gripper_close=%.3f, grasp_threshold=%.4f, feedback_topic=%s)",
+        _mode, _DEFAULT_TIMEOUT_S, _vla_max_steps,
+        _GRIPPER_OPEN, _GRIPPER_CLOSE, _gripper_grasp_threshold_width,
+        _gripper_joint_states_topic,
+    )
     return Ok()
 
 
@@ -959,6 +1166,8 @@ def activate():
             _endpoints = _resolve_inputs()
         except RuntimeError as e:
             return Err(str(e))
+        if _mode == "moveit":
+            _start_gripper_monitor()
     log.info("CMD_ACTIVATE ok — endpoints resolved: %s", list(_endpoints.keys()))
     return Ok()
 
@@ -970,6 +1179,7 @@ def deactivate():
     with _state_lock, _mcp_clients_lock:
         _endpoints = None
         _mcp_clients.clear()
+        _stop_gripper_monitor()
     log.info("CMD_DEACTIVATE ok — endpoints cleared")
     return Ok()
 
