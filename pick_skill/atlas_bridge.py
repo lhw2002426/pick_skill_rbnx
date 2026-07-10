@@ -10,14 +10,14 @@ ROS topic / service names):
 
     Pilot LLM  ──pick("the comb")──►  this skill
                                           │
-                  ┌────────── 1. detect_object ─────────────►  yolo_world_rbnx
+                  ┌────────── 1. detect_object ─────────────►  llm_detect_rbnx
                   │            (object_name → bbox + 3D center)
                   ▼
-                  ┌──── 2. grasp_request ────►  yolo_grasp_rbnx
+                  ┌──── 2. grasp_request ────►  grasp_pose_rbnx
                   │       (name + bbox + center + retry=0 → grasp_pose)
                       │
                       ▼
-                      ┌──── 3. execute_grasp ────►  piper_moveit_rbnx
+                      ┌──── 3. execute_grasp ────►  roboarm_ik_rbnx
                       │       (pre_pose + gripper full-open,
                       │        grasp_pose + gripper closed,
                       │        lift + gripper closed)
@@ -26,13 +26,12 @@ ROS topic / service names):
                       success → verify gripper did not close past threshold
                                 → sleep 2s (visual confirmation)
                                 → 4. reset (post-pick park)
-                                       ──────►  piper_moveit_rbnx
-                                       (open gripper + moveArmtoInit)
+                                       ──────►  roboarm_ik_rbnx
+                                       (open gripper + park arm)
                                 → return success
                   On timeout, execution failure, or detection failure:
-                  also call reset before returning, so cpp's sticky
-                  state machine flags (is_busy_, …) don't silently
-                  break the NEXT pick.
+                  also call reset before returning, so the next pick
+                  starts from a known arm state.
 
 Why MCP-everywhere instead of mixing in raw ROS service calls (the
 upstream pick.py path):
@@ -43,10 +42,9 @@ upstream pick.py path):
 * Topology independence — if a future deploy reshuffles which
   package owns which service, atlas resolution adapts; hardcoded
   topic names don't.
-* No /arm/arm_status polling here — execute_grasp already does that
-  internally (Stage 5 piper_moveit_rbnx) and only returns once the
-  arm has hit busy → idle. We do subscribe to /arm/joint_states_single
-  to verify the gripper did not close completely after the grasp,
+* The manipulation provider owns motion execution and its own timeout.
+  We subscribe to /arm/joint_states_single to verify the gripper did
+  not close completely after the grasp,
   mirroring roboarm's "closed too far means empty" success check.
 
 Lifecycle (Skill — lazy activate, same as explore_rbnx):
@@ -97,10 +95,9 @@ _gripper_close_width = 0.0
 _gripper_grasp_threshold_width = 0.005
 _gripper_feedback_timeout_s = 2.0
 _gripper_joint_states_topic = "/arm/joint_states_single"
-_require_gripper_feedback = True
 
-# Execution mode: "moveit" (traditional pipeline) or "vla" (end-to-end policy)
-_mode = "moveit"
+# Execution mode: "pipeline" (detect→grasp→execute) or "vla".
+_mode = "pipeline"
 
 # We deliberately keep ONE FastMCP Client per upstream URL (lazily
 # constructed in the handler, not on_activate). FastMCP's Client is
@@ -130,25 +127,11 @@ REQUIRED_INPUTS = {
 # atlas, but each key has degraded behaviour documented:
 #   "reset" — POST-GRASP park. Called 2s after a successful
 #             execute_grasp so the arm parks back at init pose with
-#             the gripper open (cpp opens to 0.025 + moveArmtoInit).
+#             the gripper open.
 #             If unavailable, pick still returns success but the arm
-#             stays at the grasp pose with the gripper closed; the
-#             NEXT pick will then wedge because cpp's is_busy_=true
-#             flag is still set. Fixed in piper_moveit_rbnx >= the
-#             commit that added /moveit_control/reset.
-#   "demo"  — DEMO mode override. Calls cpp's /moveit_control/demo
-#             which opens gripper to 0.08 m, joint-space-moves to
-#             the DEMO pose, then closes gripper to 0.025 m
-#             (simulating a grasp). Used by the commented-out demo
-#             override block at the top of pick() for showcase runs.
-#   "demo_place" — sibling of demo for the "place" half of a
-#             pick-and-place demo. Calls cpp's
-#             /moveit_control/demo_place which drives to DEMO PLACE
-#             pose, holds 2 s, opens gripper, parks at init.
+#             stays at the grasp pose with the gripper closed.
 OPTIONAL_INPUTS = {
     "reset":          ("robonix/service/manipulation/reset",                     "mcp"),
-    "demo":           ("robonix/service/manipulation/demo",                      "mcp"),
-    "demo_place":     ("robonix/service/manipulation/demo_place",                "mcp"),
     "vla_execute":    ("robonix/skill/vla/execute",                              "mcp"),
 }
 
@@ -208,8 +191,8 @@ def _resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
             raise RuntimeError(
                 f"pick skill cannot find dependencies on atlas: missing "
                 f"{[required[k][0] for k in missing]}. The skill needs "
-                f"yolo_world_rbnx (object_detect) + yolo_grasp_rbnx (grasp_pose) "
-                f"+ piper_moveit_rbnx (manipulation/execute_grasp) all ACTIVE "
+                f"llm_detect_rbnx (object_detect) + grasp_pose_rbnx (grasp_pose) "
+                f"+ roboarm_ik_rbnx (manipulation/execute_grasp) all ACTIVE "
                 f"before it can run. There is intentionally no ROS-service "
                 f"fallback — packaging-spec invariant #1.")
 
@@ -460,9 +443,7 @@ def _verify_gripper_holding(close_started_mono: float) -> tuple[bool, str, float
             f"no gripper feedback on {_gripper_joint_states_topic} within "
             f"{_gripper_feedback_timeout_s:.1f}s"
         )
-        if _require_gripper_feedback:
-            return False, msg, 0.0
-        return True, msg + " (ignored)", 0.0
+        return False, msg, 0.0
     if width < _gripper_grasp_threshold_width:
         return (
             False,
@@ -480,30 +461,11 @@ def _verify_gripper_holding(close_started_mono: float) -> tuple[bool, str, float
 
 # ── pipeline stages ─────────────────────────────────────────────────────────
 def _stage_reset() -> dict:
-    """Post-grasp park: reset the manipulation state machine + park
-    the arm at init.
-
-    Calls piper_moveit_rbnx's `manipulation/reset` MCP, which in turn
-    calls /moveit_control/reset on the cpp executor. Clears sticky
-    is_busy_ flags, opens the gripper to a neutral wide width, and
-    parks the arm at init pose so the next pick starts from a
-    known-clean state.
-
-    Called BOTH after a successful grasp (with a 2s pre-hold for
-    visual confirmation, see pick()) AND after every failed pick
-    attempt (to clean up cpp state — most failures leave is_busy_=
-    true or a stale need_to_return_init_pose_ flag, which would
-    silently break the NEXT pick).
-
-    Optional — if reset capability isn't on atlas (e.g. older
-    piper_moveit_rbnx), this is a no-op and pick() still returns
-    its grasp result, but the arm will not be parked. The NEXT pick
-    will then likely wedge on cpp's stale is_busy_=true flag.
-    """
+    """Post-grasp park through the active manipulation provider."""
     assert _endpoints is not None
     if "reset" not in _endpoints:
         log.warning("post-grasp reset SKIPPED — "
-                    "manipulation/reset not on atlas (older piper_moveit?)")
+                    "manipulation/reset not on atlas")
         return {"success": True, "message": "skipped (capability missing)",
                 "elapsed_s": 0.0}
     log.info("post-grasp reset (open gripper, park arm at init)")
@@ -513,59 +475,11 @@ def _stage_reset() -> dict:
              float(resp.get("elapsed_s", 0.0)))
     return resp
 
-
-def _stage_demo() -> dict:
-    """Demo override: drive the arm to a fixed joint-space DEMO pose
-    with the gripper open ~8 cm.
-
-    Calls piper_moveit_rbnx's `manipulation/demo` MCP, which in turn
-    calls /moveit_control/demo on the cpp executor. Used by the
-    commented-out demo override block at the top of pick() —
-    showcase runs replace the real grasp pipeline (yolo_world →
-    yolo_grasp → execute_grasp) with this single deterministic call.
-    """
-    assert _endpoints is not None
-    if "demo" not in _endpoints:
-        log.warning("demo SKIPPED — manipulation/demo not on atlas "
-                    "(older piper_moveit, or demo not yet rebuilt?)")
-        return {"success": False, "message": "demo capability not on atlas",
-                "elapsed_s": 0.0}
-    log.info("demo (open gripper to demo width, move to demo pose)")
-    resp = _mcp_call_sync(_endpoints["demo"], "demo", {"ack": True})
-    log.info("demo result: success=%s msg=%r elapsed=%.2fs",
-             resp.get("success"), resp.get("message", "")[:60],
-             float(resp.get("elapsed_s", 0.0)))
-    return resp
-
-
-def _stage_demo_place() -> dict:
-    """Demo place override: drive the arm to a fixed joint-space
-    DEMO PLACE pose, hold 2 s, open gripper, park at init.
-
-    Calls piper_moveit_rbnx's `manipulation/demo_place` MCP, which in
-    turn calls /moveit_control/demo_place on the cpp executor. Used
-    by the commented-out demo-place override block in pick() for
-    canned pick-and-place showcase runs (paired with _stage_demo).
-    """
-    assert _endpoints is not None
-    if "demo_place" not in _endpoints:
-        log.warning("demo_place SKIPPED — manipulation/demo_place not on atlas "
-                    "(older piper_moveit, or demo_place not yet rebuilt?)")
-        return {"success": False, "message": "demo_place capability not on atlas",
-                "elapsed_s": 0.0}
-    log.info("demo_place (move to demo place pose, hold, open gripper, park at init)")
-    resp = _mcp_call_sync(_endpoints["demo_place"], "demo_place", {"ack": True})
-    log.info("demo_place result: success=%s msg=%r elapsed=%.2fs",
-             resp.get("success"), resp.get("message", "")[:60],
-             float(resp.get("elapsed_s", 0.0)))
-    return resp
-
-
 def _safe_post_pick_reset(context: str) -> None:
     """Best-effort post-pick reset, never raises.
 
     Used by every pick() exit path (success AND failure) to leave
-    cpp in a clean state for the next pick. Logs but swallows any
+    the arm in a clean state for the next pick. Logs but swallows any
     exception/error so it can't poison the response we're about to
     return to the caller.
     """
@@ -650,7 +564,7 @@ def _empty_pose_dict() -> dict:
 #   3. Move to pre_pose (above target, gripper close)  — lift
 #
 # APPROACH_DIST is how far above the grasp pose to hover. This should
-# match yolo_grasp_rbnx's config/vertical_grasp.yaml approach_dist.
+# match grasp_pose_rbnx's config/vertical_grasp.yaml approach_dist.
 _APPROACH_DIST = 0.10   # m
 
 # Gripper widths for the three stages.
@@ -672,9 +586,8 @@ from builtin_interfaces_mcp import Time  # noqa: E402
 
 def _build_pose_stamped_from_dict(d: dict) -> PoseStamped:
     """Build the codegen PoseStamped dataclass from an MCP-shape dict.
-    The dict structure MUST match what yolo_grasp_rbnx and
-    piper_moveit_rbnx return for their PoseStamped fields (their
-    to_dict() output)."""
+    The dict structure must match the PoseStamped to_dict() shape returned by
+    grasp_pose and the manipulation provider."""
     h_in = d.get("header") or {}
     s_in = h_in.get("stamp") or {}
     p_in = (d.get("pose") or {})
@@ -721,8 +634,8 @@ def pick(req: Pick_Request) -> Pick_Response:
     specific named object visible to the robot's camera. The
     object_name can be any open-vocabulary description (e.g. "red
     cup", "small box", "the comb"). The pipeline detects the object
-    with YOLO-World, plans a grasp pose with the geometric yolo_grasp
-    estimator, then executes via MoveIt + the Piper arm.
+    with llm_detect, plans a grasp pose with the geometric grasp_pose
+    estimator, then executes via roboarm_ik + the Piper arm.
 
     This call is synchronous — it returns once the arm has either
     completed the grasp or the budget is exhausted. Typical end-to-end
@@ -747,102 +660,6 @@ def pick(req: Pick_Request) -> Pick_Response:
             grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
             gripper_width=0.0, score=0.0, elapsed_s=0.0,
         )
-
-    # ── DEMO MODE OVERRIDE ────────────────────────────────────────────
-    # Uncomment the block below to replace the real grasp pipeline
-    # with a single call to manipulation/demo. Every pick.pick(...)
-    # then resolves to "open gripper to ~8 cm + move to a fixed
-    # joint-space demo pose" — perfect for showcase / canned demos
-    # where the agent should look like it's grasping but you don't
-    # want to depend on perception + grasp planning succeeding.
-    #
-    # The demo path returns success=True unconditionally (i.e. it
-    # surfaces success=True to pilot whether or not the underlying
-    # cpp /moveit_control/demo Trigger reported success), so the
-    # LLM never says "I tried to grasp but failed" during a demo.
-    # If the cpp side genuinely fails, the failure is logged loudly
-    # but pick() still returns success=True.
-    #
-    # Mirroring the real-grasp success path, after demo lands we
-    # also sleep 2 s for visual confirmation and then call
-    # _safe_post_pick_reset() so the gripper closes back to 0.025
-    # and the arm parks at init (cpp's resetCallback) — without
-    # that step the demo would leave the arm stuck at the demo pose
-    # with the gripper open, and the NEXT pick would wedge on
-    # cpp's stale is_busy_ flag.
-    #
-    # To enable for a demo:
-    #   1. Make sure piper_moveit_rbnx is rebuilt with the demo
-    #      service (commit adding /moveit_control/demo).
-    #   2. Uncomment the entire `if True:` block below + its return.
-    #   3. Restart pick_skill_rbnx (or just send CMD_DEACTIVATE +
-    #      CMD_ACTIVATE so OPTIONAL_INPUTS gets re-resolved with
-    #      the new demo endpoint).
-    # To disable: re-comment.
-    #
-    # ── BEGIN demo override ──
-    # if True:
-    #     log.info("DEMO MODE: bypassing real grasp pipeline; "
-    #              "calling manipulation/demo for object_name=%r",
-    #              object_name)
-    #     dt0 = time.monotonic()
-    #     try:
-    #         _stage_demo()
-    #     except Exception as e:  # noqa: BLE001
-    #         log.warning("demo stage raised: %s — reporting success anyway",
-    #                     e)
-    #     # Mirror the real-grasp success path: hold the demo pose
-    #     # 2 s for visual confirmation, then reset (close gripper
-    #     # to 0.025 + park arm at init).
-    #     log.info("DEMO MODE: holding demo pose 2.0s before post-pick reset")
-    #     time.sleep(2.0)
-    #     _safe_post_pick_reset("after demo success")
-    #     return Pick_Response(
-    #         success=True, message="ok (demo mode)",
-    #         grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-    #         gripper_width=0.08, score=1.0,
-    #         elapsed_s=time.monotonic() - dt0,
-    #     )
-    # ── END demo override ──
-
-    # ── DEMO PLACE OVERRIDE ───────────────────────────────────────────
-    # Sibling of the demo override block above — uncomment THIS one
-    # instead (don't uncomment both; the first one to short-circuit
-    # wins and the second is unreachable) when you want every
-    # pick.pick(...) to play the "place" half of a pick-and-place
-    # demo: drive to a fixed DEMO PLACE pose, hold 2 s, open gripper,
-    # park at init.
-    #
-    # Same success semantics as the demo override: returns success=True
-    # unconditionally, mirroring the real-grasp success path with a
-    # 2 s pose-hold + post-pick reset (close gripper + park at init).
-    # cpp side already opens the gripper as part of demo_place itself,
-    # so the post-pick reset's controlGripper(0.025) immediately re-
-    # closes it — that's intentional, mirrors the close-on-park
-    # invariant of the real grasp pipeline.
-    #
-    # ── BEGIN demo_place override ──
-    # if True:
-    #     log.info("DEMO PLACE MODE: bypassing real grasp pipeline; "
-    #              "calling manipulation/demo_place for object_name=%r",
-    #              object_name)
-    #     dt0 = time.monotonic()
-    #     try:
-    #         _stage_demo_place()
-    #     except Exception as e:  # noqa: BLE001
-    #         log.warning("demo_place stage raised: %s — "
-    #                     "reporting success anyway", e)
-    #     log.info("DEMO PLACE MODE: holding place pose 2.0s before "
-    #              "post-pick reset")
-    #     time.sleep(2.0)
-    #     _safe_post_pick_reset("after demo_place success")
-    #     return Pick_Response(
-    #         success=True, message="ok (demo place mode)",
-    #         grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-    #         gripper_width=0.08, score=1.0,
-    #         elapsed_s=time.monotonic() - dt0,
-    #     )
-    # ── END demo_place override ──
 
     # ── VLA MODE ─────────────────────────────────────────────────────
     # In VLA mode, bypass the traditional detect→grasp→execute pipeline
@@ -1068,8 +885,8 @@ def pick(req: Pick_Request) -> Pick_Response:
         # Single chokepoint: every pick() exit path lands here.
         # On success: 10s pose-hold for visual confirmation, then reset.
         # On failure: reset immediately, no hold.
-        # Either way, cpp ends up with clean state machine + arm at
-        # init pose + gripper open, ready for the next pick.
+        # Either way, the arm ends at init pose + gripper open, ready
+        # for the next pick.
         if grasp_succeeded:
             log.info("grasp successful — holding pose 10.0s before post-pick reset")
             time.sleep(10.0)
@@ -1086,7 +903,7 @@ def init(cfg):
     global _mode, _vla_max_steps
     global _gripper_open_width, _gripper_close_width
     global _gripper_grasp_threshold_width, _gripper_feedback_timeout_s
-    global _gripper_joint_states_topic, _require_gripper_feedback
+    global _gripper_joint_states_topic
     global _GRIPPER_OPEN, _GRIPPER_CLOSE
     cfg = cfg or {}
     if isinstance(cfg, str):
@@ -1096,10 +913,10 @@ def init(cfg):
             return Err(f"bad config_json: {e}")
     if "mode" in cfg:
         m = str(cfg["mode"]).strip().lower()
-        if m in ("moveit", "vla"):
+        if m in ("pipeline", "vla"):
             _mode = m
         else:
-            log.warning("ignoring invalid mode: %r (must be 'moveit' or 'vla')", cfg["mode"])
+            log.warning("ignoring invalid mode: %r (must be 'pipeline' or 'vla')", cfg["mode"])
     if "vla_max_steps" in cfg:
         try:
             _vla_max_steps = int(cfg["vla_max_steps"])
@@ -1133,8 +950,6 @@ def init(cfg):
                         cfg["gripper_feedback_timeout_s"])
     if "gripper_joint_states_topic" in cfg:
         _gripper_joint_states_topic = str(cfg["gripper_joint_states_topic"])
-    if "require_gripper_feedback" in cfg:
-        _require_gripper_feedback = bool(cfg["require_gripper_feedback"])
 
     _gripper_open_width = max(0.0, _gripper_open_width)
     _gripper_close_width = max(0.0, _gripper_close_width)
@@ -1166,7 +981,7 @@ def activate():
             _endpoints = _resolve_inputs()
         except RuntimeError as e:
             return Err(str(e))
-        if _mode == "moveit":
+        if _mode == "pipeline":
             _start_gripper_monitor()
     log.info("CMD_ACTIVATE ok — endpoints resolved: %s", list(_endpoints.keys()))
     return Ok()

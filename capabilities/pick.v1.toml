@@ -18,6 +18,3 @@ idl     = "pick/srv/Pick.srv"
 
 [mode]
 type = "rpc"
-
-[semantics]
-user_invocable = true

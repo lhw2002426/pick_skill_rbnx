@@ -3,15 +3,14 @@
 # kind: skill (user-invocable atomic intent). Pilot's LLM calls
 # `robonix/skill/pick/pick(object_name)` and the skill orchestrates
 # three upstream services in sequence:
-#   * service/perception/object_detect/detect_object   (yolo_world)
-#   * service/perception/grasp_pose/grasp_request      (yolo_grasp)
-#   * service/manipulation/execute_grasp               (piper_moveit)
+#   * service/perception/object_detect/detect_object   (llm_detect)
+#   * service/perception/grasp_pose/grasp_request      (grasp_pose)
+#   * service/manipulation/execute_grasp               (roboarm_ik)
 #
 # All three are called over MCP HTTP via FastMCP's Client; atlas
 # resolves the URLs at on_activate time. There is intentionally no
-# fallback to the legacy ROS service path (/yolo/detect_object,
-# /graspnet/grasp_request, /graspnet/grasps) — Stage 6's whole point
-# is the LLM-facing surface speaks robonix contracts.
+# fallback to the legacy ROS service/topic path — the LLM-facing surface
+# speaks robonix contracts.
 #
 # Lifecycle (per Robonix developer guide §5 — skills are different):
 #   CMD_INIT      -> on_init: light. State machine reaches
@@ -37,9 +36,8 @@
 #   contract bump rather than retrofitting.
 #
 # Config (passed via Driver(CMD_INIT, config_json)):
-#   mode                 default "moveit" — "moveit" uses traditional
-#                                           detect+grasp+execute pipeline;
-#                                           "vla" uses VLA end-to-end policy
+#   mode                 default "pipeline" — detect+grasp+execute pipeline;
+#                                             "vla" uses VLA end-to-end policy
 #   The pick tool takes only object_name. The total budget is fixed
 #   at 60 s and the skill makes one grasp attempt.
 #   vla_max_steps        default 50    — max inference steps in VLA mode
