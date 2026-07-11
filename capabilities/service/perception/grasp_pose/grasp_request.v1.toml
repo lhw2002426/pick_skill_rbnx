@@ -1,0 +1,13 @@
+# Codegen mirror for the upstream grasp_pose service contract.
+#
+# pick_skill consumes this contract over gRPC but does not provide it. Keeping
+# this mirror lets `rbnx codegen` emit grasp_pb2.py and the generated gRPC stub
+# in pick_skill's own rbnx-build/codegen/proto_gen directory.
+[contract]
+id      = "robonix/service/perception/grasp_pose/grasp_request"
+version = "1"
+kind    = "service"
+idl     = "grasp/srv/GraspRequest.srv"
+
+[mode]
+type = "rpc"

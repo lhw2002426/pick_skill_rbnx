@@ -1,0 +1,13 @@
+# Put down the object currently held by the arm.
+#
+# Request has no fields; the skill releases the gripper and returns to the
+# configured teach-safe pose.
+---
+# Whether the release/reset completed.
+bool success
+
+# Human-readable status.
+string message
+
+# How long the whole operation took (s).
+float32 elapsed_s

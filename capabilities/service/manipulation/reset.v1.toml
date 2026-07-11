@@ -1,0 +1,11 @@
+# Codegen mirror for the upstream manipulation reset service contract.
+#
+# pick_skill consumes this contract over gRPC but does not provide it.
+[contract]
+id      = "robonix/service/manipulation/reset"
+version = "1"
+kind    = "service"
+idl     = "manipulation/srv/Reset.srv"
+
+[mode]
+type = "rpc"

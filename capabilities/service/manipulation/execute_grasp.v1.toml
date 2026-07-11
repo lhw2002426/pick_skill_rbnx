@@ -1,0 +1,11 @@
+# Codegen mirror for the upstream manipulation execute_grasp service contract.
+#
+# pick_skill consumes this contract over gRPC but does not provide it.
+[contract]
+id      = "robonix/service/manipulation/execute_grasp"
+version = "1"
+kind    = "service"
+idl     = "manipulation/srv/ExecuteGrasp.srv"
+
+[mode]
+type = "rpc"

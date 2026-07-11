@@ -5,19 +5,24 @@ pipeline.
 
 ## What It Does
 
-Owns `robonix/skill/pick/*` and exposes one MCP tool:
+Owns `robonix/skill/pick/*` and exposes two MCP tools:
 
 ```text
 robonix/skill/pick/pick
+robonix/skill/pick/put_down
 ```
 
-The tool accepts only:
+`pick` accepts only:
 
 ```json
 {"object_name": "comb"}
 ```
 
 It uses a fixed 60 s budget and makes one grasp attempt.
+
+`put_down` accepts an empty request and releases the currently held object by
+opening the gripper to maximum width before returning the arm to the teach-safe
+pose.
 
 ## Runtime Path
 
@@ -27,10 +32,15 @@ pilot / executor
   -> llm_detect.detect_object
   -> grasp_pose.grasp_request
   -> roboarm_ik.execute_grasp
-  -> roboarm_ik.reset
+  -> return while holding the object
+
+pilot / executor
+  -> pick_skill.put_down()
+  -> roboarm_ik.teach_safe
 ```
 
-All upstream calls are MCP HTTP calls resolved through Atlas. The skill does
+Upstream calls are resolved through Atlas. `detect_object` currently uses MCP
+HTTP; `grasp_request`, `execute_grasp`, and `reset` use gRPC. The skill does
 not call legacy ROS services or `/graspnet` topics.
 
 ## Lifecycle
@@ -43,7 +53,7 @@ first pick call:
   CMD_ACTIVATE resolves llm_detect + grasp_pose + roboarm_ik endpoints
 
 idle/deactivate:
-  endpoint and FastMCP client caches are cleared
+  endpoint and client caches are cleared
 ```
 
 ## Pipeline
@@ -55,7 +65,8 @@ idle/deactivate:
 4. Execute the three-stage motion through `roboarm_ik`:
    approach above target with gripper open, descend/close, lift.
 5. Verify gripper feedback on `/arm/joint_states_single`.
-6. Hold briefly on success, then reset/park for the next pick.
+6. On success, leave the object held until `put_down` is called.
+7. On failure, reset/park immediately for recovery.
 
 ## Config
 

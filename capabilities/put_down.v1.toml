@@ -1,0 +1,14 @@
+# robonix/skill/pick/put_down — release the currently held object.
+#
+# User-invocable atomic intent: "put down / release what the arm is holding".
+# Internally calls the atlas-resolved manipulation teach_safe service, which
+# opens the gripper to maximum width before returning the arm to the configured
+# teach-safe pose.
+[contract]
+id      = "robonix/skill/pick/put_down"
+version = "1"
+kind    = "skill"
+idl     = "pick/srv/PutDown.srv"
+
+[mode]
+type = "rpc"

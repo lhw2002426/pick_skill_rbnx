@@ -1,0 +1,11 @@
+# Codegen mirror for the upstream manipulation teach_safe service contract.
+#
+# pick_skill consumes this contract over gRPC but does not provide it.
+[contract]
+id      = "robonix/service/manipulation/teach_safe"
+version = "1"
+kind    = "service"
+idl     = "manipulation/srv/TeachSafe.srv"
+
+[mode]
+type = "rpc"

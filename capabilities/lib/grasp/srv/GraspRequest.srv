@@ -1,0 +1,32 @@
+# Compute a grasp pose for a named object from a caller-supplied bbox.
+
+# Request
+string object_name
+
+# 2D bounding box in pixel coords [x_min, y_min, x_max, y_max].
+# Required. pick_skill calls object_detect first and forwards the bbox.
+float64[] bbox_2d
+
+# 3D center hint [x, y, z] meters in camera optical frame.
+# Ignored by the current grasp_pose implementation.
+float64[] object_center_3d
+
+# Ignored by the current grasp_pose implementation.
+int32 retry
+---
+# Response
+
+# Grasp pose in output_frame, normally arm/base_link.
+geometry_msgs/PoseStamped grasp_pose
+
+# Gripper opening (m).
+float32 gripper_width
+
+# Quality score (handler-defined heuristic, higher = better).
+float32 score
+
+# Success flag.
+bool success
+
+# Status / error message.
+string message

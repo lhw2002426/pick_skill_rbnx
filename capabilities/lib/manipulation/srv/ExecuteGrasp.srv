@@ -1,0 +1,20 @@
+# Solve IK and execute a grasp motion. Send a target pose in
+# arm/base_link or base_link and a gripper width.
+
+# Request
+geometry_msgs/PoseStamped target_pose
+
+# Gripper opening width (m). 0.0 = fully closed.
+float32 gripper_width
+
+# Maximum time to wait for IK and arm motion completion (s).
+float32 timeout_s
+---
+# Response
+bool success
+
+# Human-readable status.
+string message
+
+# How long the whole operation took (s).
+float32 elapsed_s

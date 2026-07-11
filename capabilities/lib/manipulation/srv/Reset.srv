@@ -1,0 +1,15 @@
+# Park the arm at the configured init pose and open the gripper.
+
+# Request
+bool ack
+---
+# Response
+
+# Whether the reset completed.
+bool success
+
+# Status / error message.
+string message
+
+# Wall-clock seconds the reset took.
+float32 elapsed_s

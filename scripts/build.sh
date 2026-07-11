@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MulanPSL-2.0
 #
-# Build phase: rbnx codegen --mcp ONLY.
+# Build phase: rbnx codegen plus MCP dataclasses for the public pick tool.
 #
 # Skill is pure Python with NO vendored ROS packages — it talks to
-# upstream services exclusively over MCP HTTP via FastMCP's Client.
+# upstream services through Atlas-resolved MCP/gRPC endpoints.
 # So no colcon build, no graspnet_msgs, no piper_msgs in src/. The
 # only build-time concern is generating:
 #   * atlas_pb2 / atlas_pb2_grpc                 (Skill.run() runtime)
+#   * grasp_pb2 / grasp gRPC stubs               (stage2 grasp_request client)
+#   * manipulation_pb2 / manipulation gRPC stubs (execute_grasp/reset client)
 #   * pick_mcp.py                                 (Pick_Request/_Response)
 #   * geometry_msgs_mcp.py / std_msgs_mcp.py /
 #     builtin_interfaces_mcp.py                   (PoseStamped + nested,

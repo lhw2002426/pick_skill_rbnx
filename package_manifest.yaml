@@ -7,26 +7,26 @@
 #   * service/perception/grasp_pose/grasp_request      (grasp_pose)
 #   * service/manipulation/execute_grasp               (roboarm_ik)
 #
-# All three are called over MCP HTTP via FastMCP's Client; atlas
-# resolves the URLs at on_activate time. There is intentionally no
-# fallback to the legacy ROS service/topic path — the LLM-facing surface
-# speaks robonix contracts.
+# Upstream calls are resolved through Atlas. detect_object currently uses MCP
+# HTTP via FastMCP's Client; grasp_request / execute_grasp / reset use gRPC.
+# There is intentionally no fallback to the legacy ROS service/topic path —
+# the LLM-facing surface speaks robonix contracts.
 #
 # Lifecycle (per Robonix developer guide §5 — skills are different):
 #   CMD_INIT      -> on_init: light. State machine reaches
 #                    INITIALIZED at boot even if upstream peers are
 #                    still warming up. cfg parsed for forward compat.
 #   CMD_ACTIVATE  -> on_activate: executor sends this on the FIRST
-#                    LLM call. Resolve the three upstream MCP
-#                    endpoints (block up to 60s waiting for them).
-#                    No FastMCP client construction here — done
-#                    lazily in the handler.
+#                    LLM call. Resolve upstream endpoints (block up to
+#                    60s waiting for them). Clients are constructed lazily
+#                    in the handler.
 #   CMD_DEACTIVATE -> on_deactivate: drop endpoints + client cache.
 #
 # Capability surface (all under robonix/skill/pick/*):
 #   driver  — auto-declared by the framework (lifecycle gRPC entry).
-#   pick    — MCP tool: synchronous, blocks until grasp completes
-#             or budget exhausts.
+#   pick     — MCP tool: synchronous, blocks until grasp completes
+#              or budget exhausts. On success, leaves the object held.
+#   put_down — MCP tool: opens the gripper and returns the arm to teach-safe pose.
 #
 # Single-tool design (vs explore_rbnx's three-tool task_id model):
 #   pick.py upstream is synchronous (~10–30s end-to-end), and the
@@ -56,3 +56,4 @@ start: bash scripts/start.sh
 capabilities:
   - name: robonix/skill/pick/driver
   - name: robonix/skill/pick/pick
+  - name: robonix/skill/pick/put_down

@@ -5,8 +5,7 @@ Orchestrates the three upstream perception+manipulation services into
 a single user-invocable `pick(object_name)` operation, exposed as the
 `robonix/skill/pick/pick` MCP tool.
 
-Pipeline (all over MCP HTTP — atlas-resolved endpoints, no hardcoded
-ROS topic / service names):
+Pipeline (atlas-resolved endpoints, no hardcoded ROS topic / service names):
 
     Pilot LLM  ──pick("the comb")──►  this skill
                                           │
@@ -23,18 +22,20 @@ ROS topic / service names):
                       │        lift + gripper closed)
                       │
                       ▼
-                      success → verify gripper did not close past threshold
-                                → sleep 2s (visual confirmation)
-                                → 4. reset (post-pick park)
-                                       ──────►  roboarm_ik_rbnx
-                                       (open gripper + park arm)
+                  success → verify gripper did not close past threshold
+                                → return with object held in the gripper
                                 → return success
                   On timeout, execution failure, or detection failure:
-                  also call reset before returning, so the next pick
-                  starts from a known arm state.
+                  call reset before returning, so the next pick starts
+                  from a known arm state.
 
-Why MCP-everywhere instead of mixing in raw ROS service calls (the
-upstream pick.py path):
+    Pilot LLM  ──put_down()──────►  this skill
+                                          │
+                                          └──── teach_safe ─► roboarm_ik_rbnx
+                                                (open gripper + teach-safe pose)
+
+Why robonix contracts instead of raw ROS service calls (the upstream pick.py
+path):
 
 * Consistent contract surface — pilot's view of the system is the
   set of robonix/* contracts; mixing ROS services means the LLM sees
@@ -53,7 +54,7 @@ Lifecycle (Skill — lazy activate, same as explore_rbnx):
                    still be warming up).
     on_activate  — heavy. Sent by executor on first MCP call into
                    any of this skill's tools. Resolve the three
-                   upstream MCP endpoints, build the FastMCP client,
+                   upstream endpoints, build clients lazily,
                    ready to serve.
     on_deactivate — drop the FastMCP client; idle-evicted.
 """
@@ -85,7 +86,7 @@ pick_skill = Skill(
 
 # ── shared state (between on_activate + handler) ────────────────────────────
 _state_lock = threading.Lock()
-# Resolved upstream MCP endpoints. None until on_activate completes.
+# Resolved upstream endpoints. None until on_activate completes.
 # Three keys, three contract ids — see REQUIRED_INPUTS below.
 _endpoints: Optional[dict[str, str]] = None
 _DEFAULT_TIMEOUT_S   = 60.0
@@ -107,6 +108,9 @@ _mode = "pipeline"
 # overhead), so we cache the URL→Client mapping and reuse.
 _mcp_clients_lock = threading.Lock()
 _mcp_clients: dict[str, Any] = {}   # base_url → fastmcp.Client
+_grpc_clients_lock = threading.Lock()
+_grpc_channels: dict[str, Any] = {}  # host:port → grpc.Channel
+_grpc_stubs: dict[str, Any] = {}     # "kind@endpoint" → generated stub
 
 _gripper_state_lock = threading.Lock()
 _gripper_latest_width: Optional[float] = None
@@ -119,19 +123,20 @@ _gripper_monitor_stop = threading.Event()
 # ── atlas-resolved upstream contracts ───────────────────────────────────────
 REQUIRED_INPUTS = {
     "detect_object":  ("robonix/service/perception/object_detect/detect_object", "mcp"),
-    "grasp_request":  ("robonix/service/perception/grasp_pose/grasp_request",    "mcp"),
-    "execute_grasp":  ("robonix/service/manipulation/execute_grasp",             "mcp"),
+    "grasp_request":  ("robonix/service/perception/grasp_pose/grasp_request",    "grpc"),
+    "execute_grasp":  ("robonix/service/manipulation/execute_grasp",             "grpc"),
 }
 
 # Optional upstreams — pick still activates if these are missing on
 # atlas, but each key has degraded behaviour documented:
-#   "reset" — POST-GRASP park. Called 2s after a successful
-#             execute_grasp so the arm parks back at init pose with
-#             the gripper open.
-#             If unavailable, pick still returns success but the arm
-#             stays at the grasp pose with the gripper closed.
+#   "reset" — pre-pick observation pose, failure recovery, and explicit
+#             failure recovery.
+#   "teach_safe" — explicit put_down implementation. If unavailable,
+#                  successful pick still leaves the object held, but put_down
+#                  cannot run.
 OPTIONAL_INPUTS = {
-    "reset":          ("robonix/service/manipulation/reset",                     "mcp"),
+    "reset":          ("robonix/service/manipulation/reset",                     "grpc"),
+    "teach_safe":     ("robonix/service/manipulation/teach_safe",                "grpc"),
     "vla_execute":    ("robonix/skill/vla/execute",                              "mcp"),
 }
 
@@ -142,8 +147,8 @@ VLA_REQUIRED_INPUTS = {
 
 
 def _resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
-    """Block until atlas can resolve all REQUIRED_INPUTS upstream MCP
-    endpoints, or fail loudly. Then best-effort resolve OPTIONAL_INPUTS
+    """Block until atlas can resolve all REQUIRED_INPUTS upstream endpoints,
+    or fail loudly. Then best-effort resolve OPTIONAL_INPUTS
     — missing optionals only generate a warning. Same shape as
     explore_rbnx.resolve_inputs.
 
@@ -324,6 +329,219 @@ def _mcp_call_sync(url: str, tool: str, args: dict) -> dict:
         return {"_error": str(e)}
 
 
+# ── gRPC client helpers ─────────────────────────────────────────────────────
+def _grpc_channel_for(endpoint: str):
+    """Return a cached grpc.Channel for an atlas-resolved host:port."""
+    with _grpc_clients_lock:
+        ch = _grpc_channels.get(endpoint)
+        if ch is not None:
+            return ch
+        import grpc
+        ch = grpc.insecure_channel(
+            endpoint, options=[("grpc.enable_http_proxy", 0)])
+        _grpc_channels[endpoint] = ch
+        return ch
+
+
+def _grasp_request_stub_for(endpoint: str):
+    key = f"grasp_request@{endpoint}"
+    with _grpc_clients_lock:
+        stub = _grpc_stubs.get(key)
+        if stub is not None:
+            return stub
+    import robonix_contracts_pb2_grpc as contracts_grpc
+
+    stub = contracts_grpc.RobonixServicePerceptionGraspPoseGraspRequestStub(
+        _grpc_channel_for(endpoint))
+    with _grpc_clients_lock:
+        _grpc_stubs[key] = stub
+    return stub
+
+
+def _execute_grasp_stub_for(endpoint: str):
+    key = f"execute_grasp@{endpoint}"
+    with _grpc_clients_lock:
+        stub = _grpc_stubs.get(key)
+        if stub is not None:
+            return stub
+    import robonix_contracts_pb2_grpc as contracts_grpc
+
+    stub = contracts_grpc.RobonixServiceManipulationExecuteGraspStub(
+        _grpc_channel_for(endpoint))
+    with _grpc_clients_lock:
+        _grpc_stubs[key] = stub
+    return stub
+
+
+def _reset_stub_for(endpoint: str):
+    key = f"reset@{endpoint}"
+    with _grpc_clients_lock:
+        stub = _grpc_stubs.get(key)
+        if stub is not None:
+            return stub
+    import robonix_contracts_pb2_grpc as contracts_grpc
+
+    stub = contracts_grpc.RobonixServiceManipulationResetStub(
+        _grpc_channel_for(endpoint))
+    with _grpc_clients_lock:
+        _grpc_stubs[key] = stub
+    return stub
+
+
+def _teach_safe_stub_for(endpoint: str):
+    key = f"teach_safe@{endpoint}"
+    with _grpc_clients_lock:
+        stub = _grpc_stubs.get(key)
+        if stub is not None:
+            return stub
+    import robonix_contracts_pb2_grpc as contracts_grpc
+
+    stub = contracts_grpc.RobonixServiceManipulationTeachSafeStub(
+        _grpc_channel_for(endpoint))
+    with _grpc_clients_lock:
+        _grpc_stubs[key] = stub
+    return stub
+
+
+def _pose_stamped_pb_to_dict(msg: Any) -> dict:
+    return {
+        "header": {
+            "stamp": {
+                "sec": int(msg.header.stamp.sec),
+                "nanosec": int(msg.header.stamp.nanosec),
+            },
+            "frame_id": str(msg.header.frame_id),
+        },
+        "pose": {
+            "position": {
+                "x": float(msg.pose.position.x),
+                "y": float(msg.pose.position.y),
+                "z": float(msg.pose.position.z),
+            },
+            "orientation": {
+                "x": float(msg.pose.orientation.x),
+                "y": float(msg.pose.orientation.y),
+                "z": float(msg.pose.orientation.z),
+                "w": float(msg.pose.orientation.w),
+            },
+        },
+    }
+
+
+def _pose_stamped_dict_to_pb(d: dict) -> Any:
+    import builtin_interfaces_pb2
+    import geometry_msgs_pb2
+    import std_msgs_pb2
+
+    header = d.get("header", {}) or {}
+    stamp = header.get("stamp", {}) or {}
+    pose = d.get("pose", {}) or {}
+    pos = pose.get("position", {}) or {}
+    ori = pose.get("orientation", {}) or {}
+    return geometry_msgs_pb2.PoseStamped(
+        header=std_msgs_pb2.Header(
+            stamp=builtin_interfaces_pb2.Time(
+                sec=int(stamp.get("sec", 0)),
+                nanosec=int(stamp.get("nanosec", 0)),
+            ),
+            frame_id=str(header.get("frame_id", "arm/base_link")),
+        ),
+        pose=geometry_msgs_pb2.Pose(
+            position=geometry_msgs_pb2.Point(
+                x=float(pos.get("x", 0.0)),
+                y=float(pos.get("y", 0.0)),
+                z=float(pos.get("z", 0.0)),
+            ),
+            orientation=geometry_msgs_pb2.Quaternion(
+                x=float(ori.get("x", 0.0)),
+                y=float(ori.get("y", 0.0)),
+                z=float(ori.get("z", 0.0)),
+                w=float(ori.get("w", 1.0)),
+            ),
+        ),
+    )
+
+
+def _grasp_request_grpc_sync(endpoint: str, args: dict) -> dict:
+    """Call grasp_pose.grasp_request over gRPC and return MCP-shape dict."""
+    try:
+        import grasp_pb2
+
+        req = grasp_pb2.GraspRequest_Request(
+            object_name=str(args.get("object_name", "")),
+            retry=int(args.get("retry", 0)),
+        )
+        req.bbox_2d.extend(float(x) for x in args.get("bbox_2d", []) or [])
+        req.object_center_3d.extend(
+            float(x) for x in args.get("object_center_3d", []) or [])
+        resp = _grasp_request_stub_for(endpoint).GraspRequest(req)
+        return {
+            "grasp_pose": _pose_stamped_pb_to_dict(resp.grasp_pose),
+            "gripper_width": float(resp.gripper_width),
+            "score": float(resp.score),
+            "success": bool(resp.success),
+            "message": str(resp.message),
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("grpc call grasp_request failed: %s", e)
+        return {"_error": str(e)}
+
+
+def _execute_grasp_grpc_sync(endpoint: str, args: dict) -> dict:
+    """Call roboarm_ik.execute_grasp over gRPC and return dict response."""
+    try:
+        import manipulation_pb2
+
+        req = manipulation_pb2.ExecuteGrasp_Request(
+            target_pose=_pose_stamped_dict_to_pb(args.get("target_pose", {}) or {}),
+            gripper_width=float(args.get("gripper_width", 0.0)),
+            timeout_s=float(args.get("timeout_s", 0.0)),
+        )
+        resp = _execute_grasp_stub_for(endpoint).ExecuteGrasp(req)
+        return {
+            "success": bool(resp.success),
+            "message": str(resp.message),
+            "elapsed_s": float(resp.elapsed_s),
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("grpc call execute_grasp failed: %s", e)
+        return {"_error": str(e)}
+
+
+def _reset_grpc_sync(endpoint: str) -> dict:
+    """Call roboarm_ik.reset over gRPC and return dict response."""
+    try:
+        import manipulation_pb2
+
+        resp = _reset_stub_for(endpoint).Reset(
+            manipulation_pb2.Reset_Request(ack=True))
+        return {
+            "success": bool(resp.success),
+            "message": str(resp.message),
+            "elapsed_s": float(resp.elapsed_s),
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("grpc call reset failed: %s", e)
+        return {"_error": str(e)}
+
+
+def _teach_safe_grpc_sync(endpoint: str) -> dict:
+    """Call roboarm_ik.teach_safe over gRPC and return dict response."""
+    try:
+        import manipulation_pb2
+
+        resp = _teach_safe_stub_for(endpoint).TeachSafe(
+            manipulation_pb2.TeachSafe_Request(ack=True))
+        return {
+            "success": bool(resp.success),
+            "message": str(resp.message),
+            "elapsed_s": float(resp.elapsed_s),
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("grpc call teach_safe failed: %s", e)
+        return {"_error": str(e)}
+
+
 # ── gripper feedback monitor ───────────────────────────────────────────────
 def _joint_state_gripper_width(msg: Any) -> Optional[float]:
     """Extract the actual gripper opening width from JointState.
@@ -358,8 +576,8 @@ def _joint_state_gripper_width(msg: Any) -> Optional[float]:
 def _start_gripper_monitor() -> None:
     """Start a small rclpy subscriber for /arm/joint_states_single.
 
-    The skill remains MCP-first for orchestration, but the gripper
-    success signal is only available as ROS JointState feedback today.
+    The gripper success signal is only available as ROS JointState feedback
+    today.
     If ROS is unavailable, leave the monitor stopped; the pick path
     will fail at verification time when feedback is required.
     """
@@ -461,19 +679,36 @@ def _verify_gripper_holding(close_started_mono: float) -> tuple[bool, str, float
 
 # ── pipeline stages ─────────────────────────────────────────────────────────
 def _stage_reset() -> dict:
-    """Post-grasp park through the active manipulation provider."""
+    """Park through the active manipulation provider and open the gripper."""
     assert _endpoints is not None
     if "reset" not in _endpoints:
-        log.warning("post-grasp reset SKIPPED — "
+        log.warning("reset SKIPPED — "
                     "manipulation/reset not on atlas")
         return {"success": True, "message": "skipped (capability missing)",
                 "elapsed_s": 0.0}
-    log.info("post-grasp reset (open gripper, park arm at init)")
-    resp = _mcp_call_sync(_endpoints["reset"], "reset", {"ack": True})
-    log.info("post-grasp reset result: success=%s msg=%r elapsed=%.2fs",
+    log.info("reset (open gripper, park arm at init)")
+    resp = _reset_grpc_sync(_endpoints["reset"])
+    log.info("reset result: success=%s msg=%r elapsed=%.2fs",
              resp.get("success"), resp.get("message", "")[:60],
              float(resp.get("elapsed_s", 0.0)))
     return resp
+
+
+def _stage_teach_safe() -> dict:
+    """Open the gripper and park at the configured teach-safe pose."""
+    assert _endpoints is not None
+    if "teach_safe" not in _endpoints:
+        log.warning("teach_safe SKIPPED — "
+                    "manipulation/teach_safe not on atlas")
+        return {"success": False, "message": "teach_safe capability missing",
+                "elapsed_s": 0.0}
+    log.info("teach_safe (open gripper, park arm at teach-safe pose)")
+    resp = _teach_safe_grpc_sync(_endpoints["teach_safe"])
+    log.info("teach_safe result: success=%s msg=%r elapsed=%.2fs",
+             resp.get("success"), resp.get("message", "")[:60],
+             float(resp.get("elapsed_s", 0.0)))
+    return resp
+
 
 def _safe_post_pick_reset(context: str) -> None:
     """Best-effort post-pick reset, never raises.
@@ -517,7 +752,7 @@ def _stage_grasp_request(object_name: str, bbox_2d: list, center_3d: list,
         "retry":            int(retry),
     }
     log.info("stage2 grasp_request retry=%d", retry)
-    resp = _mcp_call_sync(_endpoints["grasp_request"], "grasp_request", args)
+    resp = _grasp_request_grpc_sync(_endpoints["grasp_request"], args)
     log.info("stage2 result: success=%s msg=%r score=%.3f gripper=%.3f",
              resp.get("success"), resp.get("message", "")[:60],
              float(resp.get("score", 0.0)),
@@ -536,7 +771,7 @@ def _stage_execute_grasp(grasp_pose: dict, gripper_width: float,
     }
     log.info("stage3 execute_grasp gripper_width=%.3f timeout=%.1fs",
              gripper_width, timeout_s)
-    resp = _mcp_call_sync(_endpoints["execute_grasp"], "execute_grasp", args)
+    resp = _execute_grasp_grpc_sync(_endpoints["execute_grasp"], args)
     log.info("stage3 result: success=%s msg=%r elapsed=%.2fs",
              resp.get("success"), resp.get("message", "")[:60],
              float(resp.get("elapsed_s", 0.0)))
@@ -574,7 +809,7 @@ _GRIPPER_CLOSE = _gripper_close_width
 
 # ── MCP tool (typed against codegen Pick_Request/Pick_Response) ─────────────
 from pick_mcp import (  # noqa: E402  pylint: disable=wrong-import-position
-    Pick_Request, Pick_Response,
+    Pick_Request, Pick_Response, PutDown_Request, PutDown_Response,
 )
 # Nested types we need to instantiate when building the response.
 from geometry_msgs_mcp import (  # noqa: E402
@@ -883,16 +1118,47 @@ def pick(req: Pick_Request) -> Pick_Response:
         return response
     finally:
         # Single chokepoint: every pick() exit path lands here.
-        # On success: 10s pose-hold for visual confirmation, then reset.
-        # On failure: reset immediately, no hold.
-        # Either way, the arm ends at init pose + gripper open, ready
-        # for the next pick.
         if grasp_succeeded:
-            log.info("grasp successful — holding pose 10.0s before post-pick reset")
-            time.sleep(10.0)
-            _safe_post_pick_reset("after success")
+            log.info("grasp successful — leaving object held until put_down is called")
         else:
             _safe_post_pick_reset("after failure")
+
+
+@pick_skill.mcp("robonix/skill/pick/put_down")
+def put_down(_req: PutDown_Request) -> PutDown_Response:
+    """Put down the currently held object.
+
+    This tool is intentionally exposed as an MCP skill tool so the pilot LLM
+    can call it directly after a successful pick. It releases the gripper and
+    returns the arm to the configured teach-safe pose by delegating to the
+    active manipulation/teach_safe provider.
+    """
+    if _endpoints is None:
+        return PutDown_Response(
+            success=False,
+            message="pick skill not active (atlas hasn't resolved upstream services yet)",
+            elapsed_s=0.0,
+        )
+    if "teach_safe" not in _endpoints:
+        return PutDown_Response(
+            success=False,
+            message="put_down failed: manipulation/teach_safe endpoint not resolved on atlas",
+            elapsed_s=0.0,
+        )
+
+    t0 = time.monotonic()
+    resp = _stage_teach_safe()
+    if "_error" in resp:
+        return PutDown_Response(
+            success=False,
+            message=f"put_down failed: {resp['_error']}",
+            elapsed_s=time.monotonic() - t0,
+        )
+    return PutDown_Response(
+        success=bool(resp.get("success", False)),
+        message=str(resp.get("message", "put_down complete")),
+        elapsed_s=float(resp.get("elapsed_s", time.monotonic() - t0)),
+    )
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
@@ -971,7 +1237,7 @@ def init(cfg):
 
 @pick_skill.on_activate
 def activate():
-    """CMD_ACTIVATE: heavy. Resolve upstream MCP endpoints. Idempotent."""
+    """CMD_ACTIVATE: heavy. Resolve upstream endpoints. Idempotent."""
     global _endpoints
     with _state_lock:
         if _endpoints is not None:
@@ -991,9 +1257,16 @@ def activate():
 def deactivate():
     """CMD_DEACTIVATE: drop client cache + endpoints. Idle eviction."""
     global _endpoints
-    with _state_lock, _mcp_clients_lock:
+    with _state_lock, _mcp_clients_lock, _grpc_clients_lock:
         _endpoints = None
         _mcp_clients.clear()
+        for ch in _grpc_channels.values():
+            try:
+                ch.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _grpc_channels.clear()
+        _grpc_stubs.clear()
         _stop_gripper_monitor()
     log.info("CMD_DEACTIVATE ok — endpoints cleared")
     return Ok()

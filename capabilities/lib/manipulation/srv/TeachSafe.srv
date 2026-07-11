@@ -1,0 +1,18 @@
+# Open the gripper to maximum width, then move the arm to the configured
+# teach-safe pose while keeping the gripper open.
+#
+# Request
+
+# Marker field; callers should pass true.
+bool ack
+---
+# Response
+
+# Whether the teach-safe motion completed.
+bool success
+
+# Status / error message.
+string message
+
+# Wall-clock seconds the motion took.
+float32 elapsed_s
