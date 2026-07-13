@@ -96,6 +96,7 @@ _gripper_close_width = 0.0
 _gripper_grasp_threshold_width = 0.005
 _gripper_feedback_timeout_s = 2.0
 _gripper_joint_states_topic = "/arm/joint_states_single"
+_park_at_teach_safe_after_pick = False
 
 # Execution mode: "pipeline" (detect→grasp→execute) or "vla".
 _mode = "pipeline"
@@ -525,13 +526,16 @@ def _reset_grpc_sync(endpoint: str) -> dict:
         return {"_error": str(e)}
 
 
-def _teach_safe_grpc_sync(endpoint: str) -> dict:
+def _teach_safe_grpc_sync(endpoint: str, hold_gripper: bool = False) -> dict:
     """Call roboarm_ik.teach_safe over gRPC and return dict response."""
     try:
         import manipulation_pb2
 
         resp = _teach_safe_stub_for(endpoint).TeachSafe(
-            manipulation_pb2.TeachSafe_Request(ack=True))
+            manipulation_pb2.TeachSafe_Request(
+                ack=True,
+                hold_gripper=bool(hold_gripper),
+            ))
         return {
             "success": bool(resp.success),
             "message": str(resp.message),
@@ -694,16 +698,20 @@ def _stage_reset() -> dict:
     return resp
 
 
-def _stage_teach_safe() -> dict:
-    """Open the gripper and park at the configured teach-safe pose."""
+def _stage_teach_safe(hold_gripper: bool = False) -> dict:
+    """Park at the configured teach-safe pose."""
     assert _endpoints is not None
     if "teach_safe" not in _endpoints:
         log.warning("teach_safe SKIPPED — "
                     "manipulation/teach_safe not on atlas")
         return {"success": False, "message": "teach_safe capability missing",
                 "elapsed_s": 0.0}
-    log.info("teach_safe (open gripper, park arm at teach-safe pose)")
-    resp = _teach_safe_grpc_sync(_endpoints["teach_safe"])
+    mode = "hold gripper" if hold_gripper else "release gripper"
+    log.info("teach_safe (%s, park arm at teach-safe pose)", mode)
+    resp = _teach_safe_grpc_sync(
+        _endpoints["teach_safe"],
+        hold_gripper=hold_gripper,
+    )
     log.info("teach_safe result: success=%s msg=%r elapsed=%.2fs",
              resp.get("success"), resp.get("message", "")[:60],
              float(resp.get("elapsed_s", 0.0)))
@@ -881,20 +889,12 @@ def pick(req: Pick_Request) -> Pick_Response:
     (detection / grasp planning / execution / timeout).
     """
     if _endpoints is None:
-        return Pick_Response(
-            success=False,
-            message="pick skill not active (atlas hasn't resolved upstream services yet)",
-            grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-            gripper_width=0.0, score=0.0, elapsed_s=0.0,
-        )
+        raise RuntimeError(
+            "pick skill not active (atlas hasn't resolved upstream services yet)")
 
     object_name  = (req.object_name or "").strip()
     if not object_name:
-        return Pick_Response(
-            success=False, message="object_name is empty",
-            grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-            gripper_width=0.0, score=0.0, elapsed_s=0.0,
-        )
+        raise RuntimeError("object_name is empty")
 
     # ── VLA MODE ─────────────────────────────────────────────────────
     # In VLA mode, bypass the traditional detect→grasp→execute pipeline
@@ -911,12 +911,7 @@ def pick(req: Pick_Request) -> Pick_Response:
                  instruction, total_to, _vla_max_steps)
 
         if "vla_execute" not in _endpoints:
-            return Pick_Response(
-                success=False,
-                message="VLA mode: vla_execute endpoint not resolved on atlas",
-                grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-                gripper_width=0.0, score=0.0, elapsed_s=0.0,
-            )
+            raise RuntimeError("VLA mode: vla_execute endpoint not resolved on atlas")
 
         vla_resp = _mcp_call_sync(
             _endpoints["vla_execute"], "vla_execute", {
@@ -933,12 +928,15 @@ def pick(req: Pick_Request) -> Pick_Response:
         log.info("VLA MODE result: success=%s, steps=%d, msg=%r, elapsed=%.2fs",
                  vla_success, vla_steps, vla_msg[:60], elapsed)
 
+        if not vla_success:
+            raise RuntimeError(f"vla_failed: {vla_msg or 'unknown'}")
+
         return Pick_Response(
-            success=vla_success,
+            success=True,
             message=f"vla: {vla_msg}" if vla_msg else "vla: done",
             grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
             gripper_width=0.0,
-            score=1.0 if vla_success else 0.0,
+            score=1.0,
             elapsed_s=elapsed,
         )
     # ── END VLA MODE ──────────────────────────────────────────────────
@@ -948,11 +946,6 @@ def pick(req: Pick_Request) -> Pick_Response:
     t0 = time.monotonic()
     deadline = t0 + total_to
 
-    response: Pick_Response = Pick_Response(
-        success=False, message="pick aborted before any stage ran",
-        grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-        gripper_width=0.0, score=0.0, elapsed_s=0.0,
-    )
     grasp_succeeded = False
 
     try:
@@ -964,13 +957,7 @@ def pick(req: Pick_Request) -> Pick_Response:
             rst = _stage_reset()
             if not rst.get("success", False):
                 msg = rst.get("_error") or rst.get("message", "unknown")
-                response = Pick_Response(
-                    success=False, message=f"pre_pick_reset_failed: {msg}",
-                    grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-                    gripper_width=0.0, score=0.0,
-                    elapsed_s=time.monotonic() - t0,
-                )
-                return response
+                raise RuntimeError(f"pre_pick_reset_failed: {msg}")
         else:
             log.warning("stage0 reset skipped — manipulation/reset not resolved")
 
@@ -978,13 +965,7 @@ def pick(req: Pick_Request) -> Pick_Response:
         det = _stage_detect_object(object_name)
         if "_error" in det or not det.get("success"):
             msg = det.get("_error") or det.get("message", "unknown")
-            response = Pick_Response(
-                success=False, message=f"detection_failed: {msg}",
-                grasp_pose=_build_pose_stamped_from_dict(_empty_pose_dict()),
-                gripper_width=0.0, score=0.0,
-                elapsed_s=time.monotonic() - t0,
-            )
-            return response
+            raise RuntimeError(f"detection_failed: {msg}")
 
         bbox_2d   = list(det.get("bbox_2d") or [])
         center_3d = list(det.get("object_center_3d") or [])
@@ -996,14 +977,8 @@ def pick(req: Pick_Request) -> Pick_Response:
         last_failure_msg     = "no attempts made"
 
         if time.monotonic() >= deadline:
-            response = Pick_Response(
-                success=False,
-                message=f"timeout: budget {total_to:.1f}s exhausted before grasp attempt",
-                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                gripper_width=last_gripper_width, score=last_score,
-                elapsed_s=time.monotonic() - t0,
-            )
-            return response
+            raise RuntimeError(
+                f"timeout: budget {total_to:.1f}s exhausted before grasp attempt")
 
         # Stage 2: grasp_request. The downstream contract still accepts a
         # retry index; pass 0 because pick no longer retries.
@@ -1013,14 +988,7 @@ def pick(req: Pick_Request) -> Pick_Response:
                 f"grasp_pose failed: "
                 f"{gr.get('_error') or gr.get('message', 'unknown')}")
             log.warning("%s", last_failure_msg)
-            response = Pick_Response(
-                success=False,
-                message=f"grasp attempt failed; last: {last_failure_msg}",
-                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                gripper_width=last_gripper_width, score=last_score,
-                elapsed_s=time.monotonic() - t0,
-            )
-            return response
+            raise RuntimeError(f"grasp attempt failed; last: {last_failure_msg}")
 
         last_grasp_pose_dict = gr.get("grasp_pose") or _empty_pose_dict()
         last_gripper_width   = float(gr.get("gripper_width", 0.0))
@@ -1052,14 +1020,7 @@ def pick(req: Pick_Request) -> Pick_Response:
                 f"execute failed (approach): "
                 f"{eg_a.get('_error') or eg_a.get('message', 'unknown')}")
             log.warning("%s", last_failure_msg)
-            response = Pick_Response(
-                success=False,
-                message=f"grasp attempt failed; last: {last_failure_msg}",
-                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                gripper_width=last_gripper_width, score=last_score,
-                elapsed_s=time.monotonic() - t0,
-            )
-            return response
+            raise RuntimeError(f"grasp attempt failed; last: {last_failure_msg}")
 
         # ── 3b: descend + grasp (grasp_pose + gripper close) ──
         log.info("stage3b: descend to grasp_pose, close gripper")
@@ -1071,14 +1032,7 @@ def pick(req: Pick_Request) -> Pick_Response:
                 f"execute failed (descend): "
                 f"{eg_b.get('_error') or eg_b.get('message', 'unknown')}")
             log.warning("%s", last_failure_msg)
-            response = Pick_Response(
-                success=False,
-                message=f"grasp attempt failed; last: {last_failure_msg}",
-                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                gripper_width=last_gripper_width, score=last_score,
-                elapsed_s=time.monotonic() - t0,
-            )
-            return response
+            raise RuntimeError(f"grasp attempt failed; last: {last_failure_msg}")
 
         # ── 3c: lift (pre_pose + gripper close) ──
         log.info("stage3c: lift to pre_pose, hold gripper close")
@@ -1097,17 +1051,16 @@ def pick(req: Pick_Request) -> Pick_Response:
         if not holding_ok:
             last_failure_msg = f"gripper verification failed: {holding_msg}"
             log.warning("%s", last_failure_msg)
-            response = Pick_Response(
-                success=False,
-                message=f"grasp attempt failed; last: {last_failure_msg}",
-                grasp_pose=_build_pose_stamped_from_dict(last_grasp_pose_dict),
-                gripper_width=last_gripper_width, score=last_score,
-                elapsed_s=time.monotonic() - t0,
-            )
-            return response
+            raise RuntimeError(f"grasp attempt failed; last: {last_failure_msg}")
         log.info("gripper verification ok: %s", holding_msg)
 
         grasp_succeeded = True
+        if _park_at_teach_safe_after_pick:
+            park = _stage_teach_safe(hold_gripper=True)
+            if "_error" in park or not park.get("success", False):
+                msg = park.get("_error") or park.get("message", "unknown")
+                raise RuntimeError(f"post_pick_teach_safe_failed: {msg}")
+
         response = Pick_Response(
             success=True,
             message=f"ok (vertical 3-stage grasp; {holding_msg})",
@@ -1134,28 +1087,21 @@ def put_down(_req: PutDown_Request) -> PutDown_Response:
     active manipulation/teach_safe provider.
     """
     if _endpoints is None:
-        return PutDown_Response(
-            success=False,
-            message="pick skill not active (atlas hasn't resolved upstream services yet)",
-            elapsed_s=0.0,
-        )
+        raise RuntimeError(
+            "pick skill not active (atlas hasn't resolved upstream services yet)")
     if "teach_safe" not in _endpoints:
-        return PutDown_Response(
-            success=False,
-            message="put_down failed: manipulation/teach_safe endpoint not resolved on atlas",
-            elapsed_s=0.0,
-        )
+        raise RuntimeError(
+            "put_down failed: manipulation/teach_safe endpoint not resolved on atlas")
 
     t0 = time.monotonic()
-    resp = _stage_teach_safe()
+    resp = _stage_teach_safe(hold_gripper=False)
     if "_error" in resp:
-        return PutDown_Response(
-            success=False,
-            message=f"put_down failed: {resp['_error']}",
-            elapsed_s=time.monotonic() - t0,
-        )
+        raise RuntimeError(f"put_down failed: {resp['_error']}")
+    if not resp.get("success", False):
+        raise RuntimeError(
+            f"put_down failed: {resp.get('message', 'unknown')}")
     return PutDown_Response(
-        success=bool(resp.get("success", False)),
+        success=True,
         message=str(resp.get("message", "put_down complete")),
         elapsed_s=float(resp.get("elapsed_s", time.monotonic() - t0)),
     )
@@ -1170,6 +1116,7 @@ def init(cfg):
     global _gripper_open_width, _gripper_close_width
     global _gripper_grasp_threshold_width, _gripper_feedback_timeout_s
     global _gripper_joint_states_topic
+    global _park_at_teach_safe_after_pick
     global _GRIPPER_OPEN, _GRIPPER_CLOSE
     cfg = cfg or {}
     if isinstance(cfg, str):
@@ -1216,6 +1163,8 @@ def init(cfg):
                         cfg["gripper_feedback_timeout_s"])
     if "gripper_joint_states_topic" in cfg:
         _gripper_joint_states_topic = str(cfg["gripper_joint_states_topic"])
+    if "park_at_teach_safe_after_pick" in cfg:
+        _park_at_teach_safe_after_pick = bool(cfg["park_at_teach_safe_after_pick"])
 
     _gripper_open_width = max(0.0, _gripper_open_width)
     _gripper_close_width = max(0.0, _gripper_close_width)
@@ -1227,10 +1176,11 @@ def init(cfg):
     log.info(
         "CMD_INIT ok (mode=%s, timeout_s=%.1f, "
         "grasp_attempts=1, vla_max_steps=%d, gripper_open=%.3f, "
-        "gripper_close=%.3f, grasp_threshold=%.4f, feedback_topic=%s)",
+        "gripper_close=%.3f, grasp_threshold=%.4f, feedback_topic=%s, "
+        "park_at_teach_safe_after_pick=%s)",
         _mode, _DEFAULT_TIMEOUT_S, _vla_max_steps,
         _GRIPPER_OPEN, _GRIPPER_CLOSE, _gripper_grasp_threshold_width,
-        _gripper_joint_states_topic,
+        _gripper_joint_states_topic, _park_at_teach_safe_after_pick,
     )
     return Ok()
 

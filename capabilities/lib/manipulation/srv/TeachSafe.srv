@@ -5,6 +5,10 @@
 
 # Marker field; callers should pass true.
 bool ack
+
+# Keep the current gripper width while moving to teach-safe.
+# false keeps the legacy behaviour: open the gripper before moving.
+bool hold_gripper
 ---
 # Response
 
